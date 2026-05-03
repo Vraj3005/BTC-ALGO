@@ -7,6 +7,13 @@ import plotly.express as px
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
 import io
+import requests
+import smtplib
+import ssl
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+import time
+import threading
 
 # ─────────────────────────────────────────────────────
 #  PAGE CONFIG
@@ -820,18 +827,290 @@ def monte_carlo(R_list, initial_capital, risk_pct, runs=1000):
         curves.append(capital)
     return curves
 
+
 # ─────────────────────────────────────────────────────
-#  LOAD DATA
+#  DATA CONSTANTS
 # ─────────────────────────────────────────────────────
 from datetime import date as _date
-DATA_START = _date(2018, 1, 1)   # hard-coded dataset start
-DATA_END   = _date(2025, 12, 31) # hard-coded dataset end
+DATA_START = _date(2018, 1, 1)
+DATA_END   = datetime.utcnow().date()   # always today
 
-try:
-    df_raw = load_csv()
-except Exception as e:
-    st.error(f"⚠️ Could not load `{CSV_FILE}`. Ensure it is committed to your repo.\n\n`{e}`")
-    st.stop()
+BINANCE_KLINES = "https://api.binance.com/api/v3/klines"
+
+# ─────────────────────────────────────────────────────
+#  BINANCE PAGINATED FETCH  (handles >1000 candle spans)
+# ─────────────────────────────────────────────────────
+@st.cache_data(ttl=300)
+def fetch_binance_range(start_dt, end_dt, symbol="BTCUSDT", interval="4h"):
+    """
+    Fetch all 4H candles from start_dt to end_dt via Binance REST.
+    Paginates automatically (1000 candles per request).
+    Returns DataFrame or None on error.
+    """
+    frames = []
+    cur_start = int(pd.Timestamp(start_dt).timestamp() * 1000)
+    end_ms    = int((pd.Timestamp(end_dt) + pd.Timedelta(hours=23, minutes=59)).timestamp() * 1000)
+
+    while cur_start < end_ms:
+        try:
+            r = requests.get(
+                BINANCE_KLINES,
+                params={
+                    "symbol":    symbol,
+                    "interval":  interval,
+                    "startTime": cur_start,
+                    "endTime":   end_ms,
+                    "limit":     1000,
+                },
+                timeout=15,
+            )
+            r.raise_for_status()
+            data = r.json()
+            if not data:
+                break
+            frames.append(data)
+            last_open_time = data[-1][0]
+            if last_open_time <= cur_start:
+                break
+            cur_start = last_open_time + 1
+            if len(data) < 1000:
+                break
+        except Exception:
+            break
+
+    if not frames:
+        return None
+
+    flat = [row for chunk in frames for row in chunk]
+    df = pd.DataFrame(flat, columns=[
+        "open_time","open","high","low","close","volume",
+        "close_time","qav","trades","tbbav","tbqav","ignore"
+    ])
+    for c in ["open","high","low","close","volume"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
+    df.set_index("open_time", inplace=True)
+    df = df[["open","high","low","close","volume"]].copy()
+    df.columns = ["Open","High","Low","Close","Volume"]
+    df = df[~df.index.duplicated(keep="last")]
+    df.sort_index(inplace=True)
+    return df
+
+# ─────────────────────────────────────────────────────
+#  LOAD & MERGE  CSV (2018-2025) + Binance (2026-today)
+# ─────────────────────────────────────────────────────
+@st.cache_data(ttl=300)
+def load_full_data():
+    # ── Part 1: historical CSV ─────────────────────────
+    df_hist = pd.read_csv(CSV_FILE)
+    for c in ["Open","High","Low","Close","Volume"]:
+        if c in df_hist.columns:
+            df_hist[c] = pd.to_numeric(df_hist[c], errors="coerce")
+    df_hist = df_hist[["Open","High","Low","Close","Volume"]].dropna()
+    # CSV timestamps are broken — rebuild a clean 4H index from 2018-01-01
+    df_hist.index = pd.date_range(start="2018-01-01", periods=len(df_hist), freq="4h")
+    df_hist.index.name = "Open time"
+
+    # ── Part 2: Binance 2026-01-01 → today ────────────
+    live_start = _date(2026, 1, 1)
+    live_end   = DATA_END
+    df_new = None
+    fetch_error = None
+    if live_end >= live_start:
+        df_new = fetch_binance_range(live_start, live_end)
+        if df_new is None:
+            fetch_error = "Could not fetch 2026+ data from Binance (will use CSV only)."
+
+    # ── Part 3: merge ─────────────────────────────────
+    if df_new is not None and len(df_new) > 0:
+        # Remove any CSV rows that overlap with Binance data
+        cutoff = df_new.index[0]
+        df_hist = df_hist[df_hist.index < cutoff]
+        df_combined = pd.concat([df_hist, df_new])
+        df_combined = df_combined[~df_combined.index.duplicated(keep="last")]
+        df_combined.sort_index(inplace=True)
+    else:
+        df_combined = df_hist
+
+    return df_combined, fetch_error
+
+# ─────────────────────────────────────────────────────
+#  LIVE SIGNAL ENGINE  (runs on latest Binance candles)
+# ─────────────────────────────────────────────────────
+@st.cache_data(ttl=60)
+def fetch_live_candles(symbol="BTCUSDT", interval="4h", limit=300):
+    """Latest 300 candles for the live chart and signal."""
+    try:
+        r = requests.get(
+            BINANCE_KLINES,
+            params={"symbol": symbol, "interval": interval, "limit": limit},
+            timeout=10,
+        )
+        r.raise_for_status()
+        data = r.json()
+        df = pd.DataFrame(data, columns=[
+            "open_time","open","high","low","close","volume",
+            "close_time","qav","trades","tbbav","tbqav","ignore"
+        ])
+        for c in ["open","high","low","close","volume"]:
+            df[c] = pd.to_numeric(df[c])
+        df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
+        df.set_index("open_time", inplace=True)
+        df = df[["open","high","low","close","volume"]]
+        df.columns = ["Open","High","Low","Close","Volume"]
+        return df, None
+    except Exception as e:
+        return None, str(e)
+
+def compute_live_signal(df_live, ema_span=200, swing_len=5, atr_filter=True):
+    """Run strategy logic on latest candles. Returns signal dict."""
+    if df_live is None or len(df_live) < ema_span + 30:
+        return {"signal": "NO DATA", "reason": "Not enough candles",
+                "price": 0, "ema": 0, "atr": 0, "atr_median": 0,
+                "time": pd.Timestamp.utcnow(), "sl": None, "tp": None}
+
+    df = df_live.copy()
+    df["EMA"] = df["Close"].ewm(span=ema_span, adjust=False).mean()
+    tr = pd.concat([
+        df["High"] - df["Low"],
+        (df["High"] - df["Close"].shift()).abs(),
+        (df["Low"]  - df["Close"].shift()).abs(),
+    ], axis=1).max(axis=1)
+    df["ATR"] = tr.rolling(14).mean()
+    sh = df["High"] == df["High"].rolling(swing_len * 2 + 1, center=True).max()
+    sl_sw = df["Low"]  == df["Low"].rolling(swing_len * 2 + 1, center=True).min()
+
+    atr_median   = df["ATR"].median()
+    last         = df.iloc[-1]
+    prev_window  = df.iloc[-(swing_len + 2):-1]
+
+    result = {
+        "signal":     "FLAT",
+        "price":      round(float(last["Close"]), 2),
+        "ema":        round(float(last["EMA"]), 2),
+        "atr":        round(float(last["ATR"]), 2),
+        "atr_median": round(float(atr_median), 2),
+        "time":       df.index[-1],
+        "reason":     "",
+        "sl":         None,
+        "tp":         None,
+    }
+
+    if atr_filter and last["ATR"] < atr_median:
+        result["reason"] = "ATR below median — low volatility, no trade"
+        return result
+
+    if sl_sw.iloc[-2] and last["Close"] > last["EMA"]:
+        stop = float(prev_window["Low"].min())
+        risk = last["Close"] - stop
+        if risk > 0:
+            result["signal"] = "LONG"
+            result["sl"]     = round(stop, 2)
+            result["tp"]     = round(float(last["Close"]) + risk * 3.0, 2)
+            result["reason"] = "Swing Low confirmed + Price above EMA200"
+
+    elif sh.iloc[-2] and last["Close"] < last["EMA"]:
+        stop = float(prev_window["High"].max())
+        risk = stop - last["Close"]
+        if risk > 0:
+            result["signal"] = "SHORT"
+            result["sl"]     = round(stop, 2)
+            result["tp"]     = round(float(last["Close"]) - risk * 3.0, 2)
+            result["reason"] = "Swing High confirmed + Price below EMA200"
+
+    return result
+
+# ─────────────────────────────────────────────────────
+#  EMAIL ALERT
+# ─────────────────────────────────────────────────────
+def send_signal_email(smtp_user, smtp_pass, to_email, signal_data):
+    """Send formatted HTML trade signal email via Gmail SMTP."""
+    direction = signal_data["signal"]
+    color     = "#00ff88" if direction == "LONG" else "#ff3366"
+    arrow     = "▲ LONG"  if direction == "LONG" else "▼ SHORT"
+    subject   = f"[BTC Algo] {direction} Signal — ${signal_data['price']:,.0f}"
+
+    risk_pct_sl = abs(signal_data['price'] - signal_data['sl'])  / signal_data['price'] * 100 if signal_data['sl'] else 0
+    risk_pct_tp = abs(signal_data['tp']    - signal_data['price'])/ signal_data['price'] * 100 if signal_data['tp'] else 0
+
+    html = f"""
+    <html><body style="background:#020408;color:#e8f4ff;font-family:Arial,sans-serif;padding:24px;">
+      <div style="max-width:540px;margin:auto;background:#071020;
+                  border:1px solid {color}44;border-radius:12px;padding:28px;">
+        <div style="font-size:28px;font-weight:700;color:{color};
+                    text-shadow:0 0 20px {color};margin-bottom:4px;">
+          {arrow}
+        </div>
+        <div style="font-size:13px;color:#7aa0c0;margin-bottom:20px;">
+          BTC/USDT · 4H · {signal_data['time'].strftime('%Y-%m-%d %H:%M UTC')}
+        </div>
+        <table style="width:100%;border-collapse:collapse;font-size:14px;">
+          <tr style="border-bottom:1px solid rgba(0,220,255,0.08);">
+            <td style="padding:10px 0;color:#7aa0c0;">Entry Price</td>
+            <td style="padding:10px 0;color:{color};font-weight:700;text-align:right;font-size:20px;">
+              ${signal_data['price']:,.2f}
+            </td>
+          </tr>
+          <tr style="border-bottom:1px solid rgba(0,220,255,0.08);">
+            <td style="padding:10px 0;color:#7aa0c0;">Stop Loss</td>
+            <td style="padding:10px 0;color:#ff3366;font-weight:600;text-align:right;">
+              ${signal_data['sl']:,.2f}
+              <span style="font-size:11px;color:#7aa0c0;"> ({risk_pct_sl:.2f}% risk)</span>
+            </td>
+          </tr>
+          <tr style="border-bottom:1px solid rgba(0,220,255,0.08);">
+            <td style="padding:10px 0;color:#7aa0c0;">Take Profit (3R)</td>
+            <td style="padding:10px 0;color:#00ff88;font-weight:600;text-align:right;">
+              ${signal_data['tp']:,.2f}
+              <span style="font-size:11px;color:#7aa0c0;"> (+{risk_pct_tp:.2f}%)</span>
+            </td>
+          </tr>
+          <tr style="border-bottom:1px solid rgba(0,220,255,0.08);">
+            <td style="padding:10px 0;color:#7aa0c0;">EMA200</td>
+            <td style="padding:10px 0;color:#e8f4ff;text-align:right;">${signal_data['ema']:,.2f}</td>
+          </tr>
+          <tr style="border-bottom:1px solid rgba(0,220,255,0.08);">
+            <td style="padding:10px 0;color:#7aa0c0;">ATR(14)</td>
+            <td style="padding:10px 0;color:#e8f4ff;text-align:right;">${signal_data['atr']:,.2f}</td>
+          </tr>
+          <tr>
+            <td style="padding:10px 0;color:#7aa0c0;">Reason</td>
+            <td style="padding:10px 0;color:#e8f4ff;text-align:right;">{signal_data['reason']}</td>
+          </tr>
+        </table>
+        <div style="margin-top:20px;padding:12px 16px;background:rgba(255,140,0,0.08);
+                    border-left:3px solid #ff8c00;border-radius:4px;font-size:11px;color:#7aa0c0;">
+          ⚠️ Automated algorithmic signal. Always apply your own risk management before trading.
+        </div>
+      </div>
+    </body></html>"""
+
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"]    = smtp_user
+        msg["To"]      = to_email
+        msg.attach(MIMEText(html, "html"))
+        ctx = ssl.create_default_context()
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ctx) as server:
+            server.login(smtp_user, smtp_pass)
+            server.sendmail(smtp_user, to_email, msg.as_string())
+        return True, "Email sent successfully"
+    except Exception as e:
+        return False, str(e)
+
+
+# ─────────────────────────────────────────────────────
+#  LOAD FULL DATASET (CSV 2018-2025 + Binance 2026-today)
+# ─────────────────────────────────────────────────────
+df_raw, _fetch_warn = load_full_data()
+if _fetch_warn:
+    st.warning(f"⚠️ {_fetch_warn}")
+
+# Show data source summary
+_binance_rows = int((df_raw.index >= pd.Timestamp("2026-01-01")).sum()
+                     if len(df_raw) else 0)
+_csv_rows = len(df_raw) - _binance_rows
 
 # ─────────────────────────────────────────────────────
 #  SIDEBAR
@@ -876,6 +1155,19 @@ with st.sidebar:
     mc_runs = st.slider("Simulations", 200, 5000, 1000, step=100)
 
     st.markdown('<div class="cyber-divider"></div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="cyber-divider"></div>', unsafe_allow_html=True)
+    st.markdown("### 📧 Email Alerts")
+    smtp_user   = st.text_input("Gmail address",      placeholder="you@gmail.com",        type="default")
+    smtp_pass   = st.text_input("Gmail App Password", placeholder="xxxx xxxx xxxx xxxx",  type="password")
+    alert_email = st.text_input("Send alerts to",     placeholder="recipient@email.com",   type="default")
+    st.markdown(
+        '<div style="font-family:var(--font-mono);font-size:9px;color:var(--text-dim);line-height:1.8;margin-top:4px;">'  
+        'Use a Gmail App Password (not your main password).<br>'  
+        'Enable 2FA → Google Account → Security → App Passwords.</div>',
+        unsafe_allow_html=True)
+
+    st.markdown('<div class="cyber-divider"></div>', unsafe_allow_html=True)
     run_btn = st.button("▶  RUN BACKTEST",    use_container_width=True)
     opt_btn = st.button("⚡  OPTIMIZE PARAMS", use_container_width=True)
 
@@ -886,7 +1178,8 @@ with st.sidebar:
                   letter-spacing:1px;text-transform:uppercase;margin-bottom:6px;">Dataset Info</div>
       <div style="font-family:var(--font-mono);font-size:10px;color:var(--text-mid);">
         {DATA_START.strftime('%b %d, %Y')} → {DATA_END.strftime('%b %d, %Y')}<br>
-        {len(df_raw):,} candles · 4H timeframe
+        {len(df_raw):,} total candles · 4H<br>
+        CSV 2018–2025 + Binance 2026–today
       </div>
     </div>
     """, unsafe_allow_html=True)
@@ -998,11 +1291,203 @@ st.markdown(f"""
 # ─────────────────────────────────────────────────────
 #  TABS
 # ─────────────────────────────────────────────────────
-tab_overview, tab_chart, tab_backtest, tab_optimizer, tab_mc, tab_trades = st.tabs([
-    "◈ OVERVIEW", "◈ PRICE CHART", "◈ BACKTEST", "◈ OPTIMIZER", "◈ MONTE CARLO", "◈ TRADE LOG"
+tab_live, tab_overview, tab_chart, tab_backtest, tab_optimizer, tab_mc, tab_trades = st.tabs([
+    "🔴 LIVE SIGNALS", "◈ OVERVIEW", "◈ PRICE CHART", "◈ BACKTEST", "◈ OPTIMIZER", "◈ MONTE CARLO", "◈ TRADE LOG"
 ])
 
 # ══════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════
+#  TAB 0 — LIVE SIGNALS
+# ══════════════════════════════════════════════════════
+with tab_live:
+    section_header("\U0001f534", "Live BTC/USDT Signal Monitor")
+
+    st.markdown(
+        '<div style="font-family:var(--font-mono);font-size:10px;color:var(--text-dim);'
+        'margin-bottom:12px;letter-spacing:1px;">'
+        '<span class="status-dot"></span> Auto-refreshes every 60 s · Binance 4H feed</div>',
+        unsafe_allow_html=True,
+    )
+
+    df_live, fetch_err = fetch_live_candles("BTCUSDT", "4h", 300)
+
+    if fetch_err:
+        st.error(f"\u26a0\ufe0f Could not fetch live data from Binance: {fetch_err}")
+    else:
+        sig = compute_live_signal(df_live, ema_span=ema_span, swing_len=swing_len, atr_filter=atr_filter)
+        s_type = sig["signal"]
+        s_color_map = {"LONG": "#00ff88", "SHORT": "#ff3366", "FLAT": "#00dcff", "NO DATA": "#ff8c00"}
+        s_color = s_color_map.get(s_type, "#00dcff")
+        s_bg_map = {
+            "LONG":    "rgba(0,255,136,0.06)",
+            "SHORT":   "rgba(255,51,102,0.06)",
+            "FLAT":    "rgba(0,220,255,0.04)",
+            "NO DATA": "rgba(255,140,0,0.06)",
+        }
+        s_bg    = s_bg_map.get(s_type, "rgba(0,220,255,0.04)")
+        arrow   = {"LONG": "\u25b2", "SHORT": "\u25bc", "FLAT": "\u25c6", "NO DATA": "?"}.get(s_type, "\u25c6")
+
+        st.markdown(
+            f'<div style="background:{s_bg};border:2px solid {s_color};border-radius:16px;'
+            f'padding:28px 36px;text-align:center;margin:12px 0 24px;">'
+            f'<div style="font-family:var(--font-display);font-size:52px;font-weight:800;'
+            f'color:{s_color};letter-spacing:4px;text-shadow:0 0 30px {s_color};line-height:1;">'
+            f'{arrow} {s_type}</div>'
+            f'<div style="font-family:var(--font-mono);font-size:13px;color:var(--text-mid);margin-top:10px;">'
+            f'{sig["reason"] or "No trade conditions met"}</div>'
+            f'<div style="font-family:var(--font-mono);font-size:11px;color:var(--text-dim);margin-top:6px;">'
+            f'Signal time: {sig["time"].strftime("%Y-%m-%d %H:%M UTC") if sig.get("time") else "N/A"}'
+            f'</div></div>',
+            unsafe_allow_html=True,
+        )
+
+        c1, c2, c3, c4, c5 = st.columns(5)
+        price_change = ((df_live["Close"].iloc[-1] / df_live["Close"].iloc[-2]) - 1) * 100 if len(df_live) > 1 else 0
+        sl_dist = f"{abs(sig['price'] - sig['sl']) / sig['price'] * 100:.2f}% from entry" if sig['sl'] else "No signal"
+        tp_dist = f"{abs(sig['tp'] - sig['price']) / sig['price'] * 100:.2f}% from entry" if sig['tp'] else "No signal"
+        for col, label, val, sub, clr in [
+            (c1, "BTC Price",    f"${sig['price']:,.2f}",                        f"{price_change:+.2f}% last candle",        "positive" if price_change >= 0 else "negative"),
+            (c2, "EMA 200",      f"${sig['ema']:,.2f}",                          "Trend baseline",                           "neutral"),
+            (c3, "ATR (14)",     f"${sig['atr']:,.2f}",                          f"Median: ${sig['atr_median']:,.2f}",        "positive" if sig['atr'] >= sig['atr_median'] else "warm"),
+            (c4, "Stop Loss",    f"${sig['sl']:,.2f}" if sig['sl'] else "\u2014", sl_dist,                                   "negative"),
+            (c5, "Take Profit",  f"${sig['tp']:,.2f}" if sig['tp'] else "\u2014", tp_dist,                                   "positive"),
+        ]:
+            with col:
+                st.markdown(metric_card(label, val, sub, clr), unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        section_header("\U0001f4e7", "Signal Email Alert")
+
+        col_em1, col_em2 = st.columns([2, 1])
+        with col_em1:
+            if s_type in ("LONG", "SHORT"):
+                if st.button("\U0001f4e8  Send Signal Email Now", use_container_width=True):
+                    if not smtp_user or not smtp_pass or not alert_email:
+                        st.error("\u26a0\ufe0f Fill in Gmail address, App Password and recipient in the sidebar first.")
+                    else:
+                        with st.spinner("Sending email\u2026"):
+                            ok, msg_out = send_signal_email(smtp_user, smtp_pass, alert_email, sig)
+                        if ok:
+                            st.success(f"\u2705 Email sent to {alert_email}")
+                        else:
+                            st.error(f"\u274c Failed: {msg_out}")
+            else:
+                st.markdown(
+                    '<div class="info-box">No active signal \u2014 email alert will be available '
+                    'when a LONG or SHORT signal fires.</div>',
+                    unsafe_allow_html=True,
+                )
+        with col_em2:
+            st.markdown(
+                '<div class="info-box"><b>Auto-refresh:</b> Page reloads every 60 s.<br>'
+                'Fill sidebar Gmail details to send alerts when a signal appears.</div>',
+                unsafe_allow_html=True,
+            )
+
+        section_header("\U0001f4c8", "Live Price Chart \u2014 Last 100 Candles")
+        df_plot = df_live.tail(100)
+        fig_live = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                                 vertical_spacing=0.03, row_heights=[0.75, 0.25])
+        fig_live.add_trace(go.Candlestick(
+            x=df_plot.index, open=df_plot["Open"], high=df_plot["High"],
+            low=df_plot["Low"], close=df_plot["Close"],
+            increasing_line_color="#00ff88", decreasing_line_color="#ff3366",
+            increasing_fillcolor="rgba(0,255,136,0.7)", decreasing_fillcolor="rgba(255,51,102,0.7)",
+            name="OHLC", showlegend=False,
+        ), row=1, col=1)
+        ema_live = df_live["Close"].ewm(span=ema_span, adjust=False).mean().tail(100)
+        fig_live.add_trace(go.Scatter(
+            x=df_plot.index, y=ema_live.values,
+            line=dict(color="#ff8c00", width=1.5), name=f"EMA{ema_span}",
+        ), row=1, col=1)
+        if s_type in ("LONG", "SHORT"):
+            fig_live.add_trace(go.Scatter(
+                x=[df_plot.index[-1]],
+                y=[df_plot["Low"].iloc[-1] * 0.997 if s_type == "LONG" else df_plot["High"].iloc[-1] * 1.003],
+                mode="markers+text",
+                marker=dict(symbol="triangle-up" if s_type == "LONG" else "triangle-down",
+                            color=s_color, size=16, line=dict(color="white", width=1)),
+                text=[s_type],
+                textposition="bottom center" if s_type == "LONG" else "top center",
+                textfont=dict(color=s_color, size=11, family="JetBrains Mono"),
+                name=f"Signal: {s_type}",
+            ), row=1, col=1)
+            if sig["sl"]:
+                fig_live.add_hline(y=sig["sl"], line_dash="dash", line_color="#ff3366", line_width=1.2,
+                                   row=1, col=1,
+                                   annotation_text=f"SL ${sig['sl']:,.0f}",
+                                   annotation_font=dict(color="#ff3366", family="JetBrains Mono", size=10))
+            if sig["tp"]:
+                fig_live.add_hline(y=sig["tp"], line_dash="dash", line_color="#00ff88", line_width=1.2,
+                                   row=1, col=1,
+                                   annotation_text=f"TP ${sig['tp']:,.0f}",
+                                   annotation_font=dict(color="#00ff88", family="JetBrains Mono", size=10))
+        vol_colors = ["rgba(0,255,136,0.5)" if c >= o else "rgba(255,51,102,0.5)"
+                      for c, o in zip(df_plot["Close"], df_plot["Open"])]
+        fig_live.add_trace(go.Bar(x=df_plot.index, y=df_plot["Volume"],
+                                  marker_color=vol_colors, name="Volume"), row=2, col=1)
+        fig_live.update_layout(**PLOTLY_LAYOUT, height=560,
+                               title="BTC/USDT Live 4H  \u00b7  Binance",
+                               xaxis_rangeslider_visible=False)
+        fig_live.update_yaxes(title_text="Price (USD)", row=1)
+        fig_live.update_yaxes(title_text="Volume", row=2)
+        st.plotly_chart(fig_live, use_container_width=True)
+
+        section_header("📋", "Signal History (This Session)")
+
+        if "signal_history" not in st.session_state:
+            st.session_state["signal_history"] = []
+        if "last_auto_email_time" not in st.session_state:
+            st.session_state["last_auto_email_time"] = None
+
+        if s_type in ("LONG", "SHORT"):
+            cur_time_str = sig["time"].strftime("%Y-%m-%d %H:%M")
+            last_logged  = st.session_state["signal_history"][-1]["Time"] if st.session_state["signal_history"] else None
+
+            # Log new signal
+            if last_logged != cur_time_str:
+                st.session_state["signal_history"].append({
+                    "Time":   cur_time_str,
+                    "Signal": s_type,
+                    "Price":  f"${sig['price']:,.2f}",
+                    "SL":     f"${sig['sl']:,.2f}",
+                    "TP":     f"${sig['tp']:,.2f}",
+                    "Reason": sig["reason"],
+                    "Email":  "Pending",
+                })
+
+                # AUTO-SEND email for every new signal
+                if smtp_user and smtp_pass and alert_email:
+                    with st.spinner("📧 New signal — sending email…"):
+                        ok, msg_out = send_signal_email(smtp_user, smtp_pass, alert_email, sig)
+                    if ok:
+                        st.session_state["signal_history"][-1]["Email"] = "✅ Sent"
+                        st.session_state["last_auto_email_time"] = cur_time_str
+                        st.success(f"✅ Auto-email sent to {alert_email} — {s_type} @ {cur_time_str}")
+                    else:
+                        st.session_state["signal_history"][-1]["Email"] = f"❌ {msg_out}"
+                        st.warning(f"⚠️ Auto-email failed: {msg_out}")
+                else:
+                    st.session_state["signal_history"][-1]["Email"] = "No credentials set"
+
+        if st.session_state["signal_history"]:
+            st.dataframe(pd.DataFrame(st.session_state["signal_history"][::-1]),
+                         use_container_width=True, hide_index=True, height=280)
+        else:
+            st.markdown(
+                '<div class="info-box">No signals yet this session. '
+                'Signals log automatically; email fires if credentials are set in sidebar.</div>',
+                unsafe_allow_html=True,
+            )
+
+        if st.session_state.get("last_auto_email_time"):
+            st.markdown(
+                f'<div class="info-box">📧 Last auto-email: {st.session_state["last_auto_email_time"]}</div>',
+                unsafe_allow_html=True,
+            )
+
+
 #  TAB 1 — OVERVIEW
 # ══════════════════════════════════════════════════════
 with tab_overview:
