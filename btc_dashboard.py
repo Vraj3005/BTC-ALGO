@@ -26,9 +26,7 @@ from streamlit_autorefresh import st_autorefresh
 #    3. Hard-coded fallbacks below
 #
 #  For Streamlit Cloud → add to App Secrets (Settings):
-#    SMTP_USER   = "madhur69699696@gmail.com"
-#    SMTP_PASS   = "njme rddp hmlh vomd"
-#    ALERT_EMAIL = "patelvrajpatel30@gmail.com"
+
 # ─────────────────────────────────────────────────────
 def _secret(key, fallback):
     try:
