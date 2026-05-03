@@ -14,6 +14,248 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import time
 import threading
+import os
+import logging
+from streamlit_autorefresh import st_autorefresh
+
+# ─────────────────────────────────────────────────────
+#  ALERT CONFIG
+#  Credentials are read (in priority order) from:
+#    1. Streamlit Secrets  (.streamlit/secrets.toml)
+#    2. Environment variables
+#    3. Hard-coded fallbacks below
+#
+#  For Streamlit Cloud → add to App Secrets (Settings):
+#    SMTP_USER   = "madhur69699696@gmail.com"
+#    SMTP_PASS   = "njme rddp hmlh vomd"
+#    ALERT_EMAIL = "patelvrajpatel30@gmail.com"
+# ─────────────────────────────────────────────────────
+def _secret(key, fallback):
+    try:
+        return st.secrets[key]
+    except Exception:
+        return os.getenv(key, fallback)
+
+ALERT_CONFIG = {
+    "SMTP_USER":            _secret("SMTP_USER",   "madhur69699696@gmail.com"),
+    "SMTP_PASS":            _secret("SMTP_PASS",   "njme rddp hmlh vomd"),
+    "ALERT_EMAIL":          _secret("ALERT_EMAIL", "patelvrajpatel30@gmail.com"),
+    "EMA_SPAN":             200,
+    "SWING_LEN":            5,
+    "ATR_FILTER":           True,
+    "RR":                   3.0,
+    "CHECK_EVERY_SECONDS":  1800,   # check every 30 min
+}
+
+# ─────────────────────────────────────────────────────
+#  BACKGROUND ALERTER  (runs 24/7 independent of UI)
+# ─────────────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s  %(levelname)-8s  %(message)s",
+                    datefmt="%Y-%m-%d %H:%M:%S")
+_log = logging.getLogger("btc_bg_alerter")
+
+@st.cache_resource
+def _get_alerter_state():
+    """Shared mutable dict kept alive for the lifetime of the server process."""
+    return {
+        "running":          False,
+        "last_signal_time": None,
+        "last_check":       None,
+        "last_signal":      "—",
+        "last_price":       0.0,
+        "emails_sent":      0,
+        "errors":           0,
+        "log":              [],          # last 20 entries
+    }
+
+def _bg_fetch_candles():
+    """Fetch latest 300 4H candles from Binance (background thread use)."""
+    try:
+        r = requests.get(
+            "https://api.binance.com/api/v3/klines",
+            params={"symbol": "BTCUSDT", "interval": "4h", "limit": 300},
+            timeout=15,
+        )
+        r.raise_for_status()
+        data = r.json()
+        df = pd.DataFrame(data, columns=[
+            "open_time","open","high","low","close","volume",
+            "close_time","qav","trades","tbbav","tbqav","ignore"
+        ])
+        for c in ["open","high","low","close","volume"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+        df.set_index("open_time", inplace=True)
+        df = df[["open","high","low","close","volume"]].copy()
+        df.columns = ["Open","High","Low","Close","Volume"]
+        return df
+    except Exception as e:
+        _log.error(f"BG fetch failed: {e}")
+        return None
+
+def _bg_compute_signal(df):
+    """Run EMA + Swing + ATR strategy (background thread version)."""
+    cfg = ALERT_CONFIG
+    if df is None or len(df) < cfg["EMA_SPAN"] + 30:
+        return {"signal": "NO DATA"}
+    df = df.copy()
+    df["EMA"] = df["Close"].ewm(span=cfg["EMA_SPAN"], adjust=False).mean()
+    tr = pd.concat([
+        df["High"] - df["Low"],
+        (df["High"] - df["Close"].shift()).abs(),
+        (df["Low"]  - df["Close"].shift()).abs(),
+    ], axis=1).max(axis=1)
+    df["ATR"] = tr.rolling(14).mean()
+    n   = cfg["SWING_LEN"]
+    sh  = df["High"] == df["High"].rolling(n * 2 + 1, center=True).max()
+    sl_ = df["Low"]  == df["Low"].rolling(n * 2 + 1, center=True).min()
+    atr_med = df["ATR"].median()
+    last    = df.iloc[-1]
+    prev_w  = df.iloc[-(n + 2):-1]
+    result  = {
+        "signal": "FLAT", "price": round(float(last["Close"]), 2),
+        "ema": round(float(last["EMA"]), 2), "atr": round(float(last["ATR"]), 2),
+        "atr_median": round(float(atr_med), 2), "time": df.index[-1],
+        "reason": "", "sl": None, "tp": None,
+    }
+    if cfg["ATR_FILTER"] and last["ATR"] < atr_med:
+        result["reason"] = "ATR below median — low volatility"
+        return result
+    if sl_.iloc[-2] and last["Close"] > last["EMA"]:
+        stop = float(prev_w["Low"].min())
+        risk = last["Close"] - stop
+        if risk > 0:
+            result.update({"signal": "LONG", "sl": round(stop, 2),
+                           "tp": round(float(last["Close"]) + risk * cfg["RR"], 2),
+                           "reason": "Swing Low + Price above EMA200"})
+    elif sh.iloc[-2] and last["Close"] < last["EMA"]:
+        stop = float(prev_w["High"].max())
+        risk = stop - last["Close"]
+        if risk > 0:
+            result.update({"signal": "SHORT", "sl": round(stop, 2),
+                           "tp": round(float(last["Close"]) - risk * cfg["RR"], 2),
+                           "reason": "Swing High + Price below EMA200"})
+    return result
+
+def _bg_send_email(sig):
+    """Send alert email from the background thread."""
+    cfg       = ALERT_CONFIG
+    direction = sig["signal"]
+    color     = "#00ff88" if direction == "LONG" else "#ff3366"
+    arrow     = "▲ LONG"  if direction == "LONG" else "▼ SHORT"
+    sl_pct    = abs(sig["price"] - sig["sl"])   / sig["price"] * 100
+    tp_pct    = abs(sig["tp"]    - sig["price"]) / sig["price"] * 100
+    ts        = sig["time"].strftime("%Y-%m-%d %H:%M UTC")
+    subject   = f"[BTC Algo] {direction} Signal — ${sig['price']:,.0f}  |  {ts}"
+    html = f"""
+    <html><body style="background:#020408;color:#e8f4ff;
+                       font-family:Arial,sans-serif;padding:24px;">
+      <div style="max-width:540px;margin:auto;background:#071020;
+                  border:1px solid {color}55;border-radius:12px;padding:28px;">
+        <div style="font-size:30px;font-weight:700;color:{color};margin-bottom:4px;">{arrow}</div>
+        <div style="font-size:12px;color:#7aa0c0;margin-bottom:24px;">BTC/USDT · 4H · {ts}</div>
+        <table style="width:100%;border-collapse:collapse;font-size:15px;">
+          <tr style="border-bottom:1px solid rgba(255,255,255,0.06);">
+            <td style="padding:10px 0;color:#7aa0c0;">Entry Price</td>
+            <td style="padding:10px 0;color:{color};font-weight:700;font-size:22px;text-align:right;">${sig['price']:,.2f}</td>
+          </tr>
+          <tr style="border-bottom:1px solid rgba(255,255,255,0.06);">
+            <td style="padding:10px 0;color:#7aa0c0;">Stop Loss</td>
+            <td style="padding:10px 0;color:#ff3366;font-weight:600;text-align:right;">${sig['sl']:,.2f} <span style="font-size:11px;color:#7aa0c0;">({sl_pct:.2f}% risk)</span></td>
+          </tr>
+          <tr style="border-bottom:1px solid rgba(255,255,255,0.06);">
+            <td style="padding:10px 0;color:#7aa0c0;">Take Profit ({cfg['RR']}R)</td>
+            <td style="padding:10px 0;color:#00ff88;font-weight:600;text-align:right;">${sig['tp']:,.2f} <span style="font-size:11px;color:#7aa0c0;">(+{tp_pct:.2f}%)</span></td>
+          </tr>
+          <tr style="border-bottom:1px solid rgba(255,255,255,0.06);">
+            <td style="padding:10px 0;color:#7aa0c0;">EMA {cfg['EMA_SPAN']}</td>
+            <td style="padding:10px 0;color:#e8f4ff;text-align:right;">${sig['ema']:,.2f}</td>
+          </tr>
+          <tr><td style="padding:10px 0;color:#7aa0c0;">ATR(14)</td>
+            <td style="padding:10px 0;color:#e8f4ff;text-align:right;">${sig['atr']:,.2f} <span style="font-size:11px;color:#7aa0c0;">(median ${sig['atr_median']:,.2f})</span></td>
+          </tr>
+          <tr><td style="padding:10px 0;color:#7aa0c0;">Reason</td>
+            <td style="padding:10px 0;color:#e8f4ff;text-align:right;">{sig['reason']}</td>
+          </tr>
+        </table>
+        <div style="margin-top:22px;padding:12px 16px;background:rgba(255,140,0,0.07);
+                    border-left:3px solid #ff8c00;border-radius:4px;
+                    font-size:11px;color:#7aa0c0;line-height:1.7;">
+          ⚠️ Automated algorithmic signal. Always apply your own risk management.
+        </div>
+      </div>
+    </body></html>"""
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"]    = cfg["SMTP_USER"]
+        msg["To"]      = cfg["ALERT_EMAIL"]
+        msg.attach(MIMEText(html, "html"))
+        ctx = ssl.create_default_context()
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ctx) as server:
+            server.login(cfg["SMTP_USER"], cfg["SMTP_PASS"])
+            server.sendmail(cfg["SMTP_USER"], cfg["ALERT_EMAIL"], msg.as_string())
+        _log.info(f"BG email sent: {direction} @ ${sig['price']:,.2f}")
+        return True
+    except Exception as e:
+        _log.error(f"BG email failed: {e}")
+        return False
+
+@st.cache_resource
+def start_background_alerter():
+    """
+    Starts a single background daemon thread that checks for signals every
+    30 minutes and emails ALERT_CONFIG['ALERT_EMAIL'] on LONG / SHORT.
+    The thread is kept alive by @st.cache_resource for the entire server
+    process lifetime — it keeps running even when nobody has the browser open.
+
+    NOTE: On Streamlit Community Cloud free tier the whole server process
+    sleeps after ~15 min of zero traffic. To truly run 24/7, point a free
+    UptimeRobot monitor at your app URL with a 5-minute check interval.
+    """
+    state = _get_alerter_state()
+    if state["running"]:
+        return state   # already started
+
+    def _loop():
+        state["running"] = True
+        _log.info("▶ Background alerter thread started.")
+        while True:
+            try:
+                state["last_check"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+                df = _bg_fetch_candles()
+                sig = _bg_compute_signal(df)
+                state["last_signal"] = sig["signal"]
+                state["last_price"]  = sig.get("price", 0.0)
+
+                if sig["signal"] in ("LONG", "SHORT"):
+                    sig_time = sig["time"]
+                    if sig_time != state["last_signal_time"]:
+                        ok = _bg_send_email(sig)
+                        entry = {
+                            "time":   sig_time.strftime("%Y-%m-%d %H:%M UTC"),
+                            "signal": sig["signal"],
+                            "price":  f"${sig['price']:,.2f}",
+                            "sl":     f"${sig['sl']:,.2f}",
+                            "tp":     f"${sig['tp']:,.2f}",
+                            "email":  "✅ Sent" if ok else "❌ Failed",
+                        }
+                        state["log"] = ([entry] + state["log"])[:20]
+                        if ok:
+                            state["emails_sent"] += 1
+                            state["last_signal_time"] = sig_time
+                        else:
+                            state["errors"] += 1
+            except Exception as e:
+                state["errors"] += 1
+                _log.error(f"BG alerter loop error: {e}")
+
+            time.sleep(ALERT_CONFIG["CHECK_EVERY_SECONDS"])
+
+    t = threading.Thread(target=_loop, daemon=True, name="btc_bg_alerter")
+    t.start()
+    return state
 
 # ─────────────────────────────────────────────────────
 #  PAGE CONFIG
@@ -24,6 +266,12 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+# Auto-refresh every 60 seconds — keeps the page alive and pulls fresh signals
+_refresh_count = st_autorefresh(interval=60_000, limit=None, key="live_refresh")
+
+# Launch background alerter (one-time; survives page refreshes via cache_resource)
+_alerter_state = start_background_alerter()
 
 # ─────────────────────────────────────────────────────
 #  GLOBAL CSS — Premium Cyber-Finance Theme
@@ -1158,9 +1406,9 @@ with st.sidebar:
 
     st.markdown('<div class="cyber-divider"></div>', unsafe_allow_html=True)
     st.markdown("### 📧 Email Alerts")
-    smtp_user   = st.text_input("Gmail address",      placeholder="you@gmail.com",        type="default")
-    smtp_pass   = st.text_input("Gmail App Password", placeholder="xxxx xxxx xxxx xxxx",  type="password")
-    alert_email = st.text_input("Send alerts to",     placeholder="recipient@email.com",   type="default")
+    smtp_user   = st.text_input("Gmail address",      value=ALERT_CONFIG["SMTP_USER"],   type="default")
+    smtp_pass   = st.text_input("Gmail App Password", value=ALERT_CONFIG["SMTP_PASS"],   type="password")
+    alert_email = st.text_input("Send alerts to",     value=ALERT_CONFIG["ALERT_EMAIL"], type="default")
     st.markdown(
         '<div style="font-family:var(--font-mono);font-size:9px;color:var(--text-dim);line-height:1.8;margin-top:4px;">'  
         'Use a Gmail App Password (not your main password).<br>'  
@@ -1486,6 +1734,76 @@ with tab_live:
                 f'<div class="info-box">📧 Last auto-email: {st.session_state["last_auto_email_time"]}</div>',
                 unsafe_allow_html=True,
             )
+
+        # ── Background Alerter Status ────────────────────
+        cyber_divider()
+        section_header("🤖", "24/7 Background Alerter Status")
+
+        _s = _alerter_state
+        _running_color = "#00ff88" if _s["running"] else "#ff8c00"
+        _running_label = "RUNNING" if _s["running"] else "STARTING…"
+        st.markdown(f"""
+        <div style="background:rgba(0,220,255,0.04);border:1px solid rgba(0,220,255,0.15);
+                    border-radius:10px;padding:18px 22px;margin:8px 0;">
+          <div style="display:flex;gap:32px;flex-wrap:wrap;align-items:center;">
+            <div>
+              <div style="font-family:var(--font-mono);font-size:9px;color:var(--text-dim);
+                          letter-spacing:1px;text-transform:uppercase;">Thread Status</div>
+              <div style="font-family:var(--font-display);font-size:18px;font-weight:700;
+                          color:{_running_color};margin-top:4px;">
+                <span style="display:inline-block;width:8px;height:8px;border-radius:50%;
+                             background:{_running_color};margin-right:6px;
+                             box-shadow:0 0 8px {_running_color};"></span>
+                {_running_label}
+              </div>
+            </div>
+            <div>
+              <div style="font-family:var(--font-mono);font-size:9px;color:var(--text-dim);
+                          letter-spacing:1px;text-transform:uppercase;">Last Check</div>
+              <div style="font-family:var(--font-mono);font-size:13px;color:var(--text-mid);margin-top:4px;">
+                {_s["last_check"] or "Pending…"}
+              </div>
+            </div>
+            <div>
+              <div style="font-family:var(--font-mono);font-size:9px;color:var(--text-dim);
+                          letter-spacing:1px;text-transform:uppercase;">Last BG Signal</div>
+              <div style="font-family:var(--font-display);font-size:15px;font-weight:700;
+                          color:{"#00ff88" if _s["last_signal"]=="LONG" else "#ff3366" if _s["last_signal"]=="SHORT" else "#00dcff"};
+                          margin-top:4px;">
+                {_s["last_signal"]}
+                {"  $"+f"{_s['last_price']:,.0f}" if _s["last_price"] else ""}
+              </div>
+            </div>
+            <div>
+              <div style="font-family:var(--font-mono);font-size:9px;color:var(--text-dim);
+                          letter-spacing:1px;text-transform:uppercase;">Emails Sent</div>
+              <div style="font-family:var(--font-display);font-size:18px;font-weight:700;
+                          color:#00ff88;margin-top:4px;">{_s["emails_sent"]}</div>
+            </div>
+            <div>
+              <div style="font-family:var(--font-mono);font-size:9px;color:var(--text-dim);
+                          letter-spacing:1px;text-transform:uppercase;">Errors</div>
+              <div style="font-family:var(--font-display);font-size:18px;font-weight:700;
+                          color:{"#ff3366" if _s["errors"] else "#3a5a78"};margin-top:4px;">
+                {_s["errors"]}
+              </div>
+            </div>
+          </div>
+        </div>
+        <div style="font-family:var(--font-mono);font-size:10px;color:var(--text-dim);
+                    padding:6px 4px;line-height:1.8;">
+          ⚡ Background thread checks Binance every 30 min and emails
+          <b style="color:var(--cyan)">{ALERT_CONFIG["ALERT_EMAIL"]}</b> on every new LONG/SHORT — 
+          even when the browser is closed.<br>
+          ⚠️ On Streamlit Community Cloud free tier, the app sleeps after ~15 min with no visitors.
+          To prevent sleep, add a free <b style="color:#ff8c00">UptimeRobot</b> monitor that
+          pings your app URL every 5 minutes.
+        </div>
+        """, unsafe_allow_html=True)
+
+        if _s["log"]:
+            st.markdown("**Background Alerter Email Log** (last 20 signals):", unsafe_allow_html=False)
+            st.dataframe(pd.DataFrame(_s["log"]), use_container_width=True, hide_index=True, height=220)
 
 
 #  TAB 1 — OVERVIEW
