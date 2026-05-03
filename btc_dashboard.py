@@ -37,9 +37,9 @@ def _secret(key, fallback):
         return os.getenv(key, fallback)
 
 ALERT_CONFIG = {
-    "SMTP_USER":            _secret("SMTP_USER",   "madhur69699696@gmail.com"),
-    "SMTP_PASS":            _secret("SMTP_PASS",   "njme rddp hmlh vomd"),
-    "ALERT_EMAIL":          _secret("ALERT_EMAIL", "patelvrajpatel30@gmail.com"),
+    "SMTP_USER":            _secret("SMTP_USER",   ""),
+    "SMTP_PASS":            _secret("SMTP_PASS",   ""),
+    "ALERT_EMAIL":          _secret("ALERT_EMAIL", ""),
     "EMA_SPAN":             200,
     "SWING_LEN":            5,
     "ATR_FILTER":           True,
