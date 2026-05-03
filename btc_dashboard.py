@@ -39,7 +39,7 @@ ALERT_CONFIG = {
     "SMTP_PASS":            _secret("SMTP_PASS",   ""),
     "ALERT_EMAIL":          _secret("ALERT_EMAIL", ""),
     "EMA_SPAN":             200,
-    "SWING_LEN":            5,
+    "SWING_LEN":            7,
     "ATR_FILTER":           True,
     "RR":                   3.0,
     "CHECK_EVERY_SECONDS":  1800,   # check every 30 min
@@ -1267,7 +1267,7 @@ def fetch_live_candles(symbol="BTCUSDT", interval="4h", limit=300):
     """Latest 300 candles for the live chart and signal (Bybit → OKX fallback)."""
     return _fetch_latest_candles(limit=limit)
 
-def compute_live_signal(df_live, ema_span=200, swing_len=5, atr_filter=True):
+def compute_live_signal(df_live, ema_span=200, swing_len=7, atr_filter=True):
     """Run strategy logic on latest candles. Returns signal dict."""
     if df_live is None or len(df_live) < ema_span + 30:
         return {"signal": "NO DATA", "reason": "Not enough candles",
@@ -1430,7 +1430,7 @@ with st.sidebar:
     """, unsafe_allow_html=True)
 
     st.markdown("### ⚙ Strategy")
-    swing_len = st.slider("Swing Period", 3, 12, 5,
+    swing_len = st.slider("Swing Period", 3, 12, 7,
                           help="Lookback bars for swing high/low detection")
     ema_span  = st.slider("EMA Trend Period", 50, 500, 200, step=10)
 
