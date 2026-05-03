@@ -37,9 +37,9 @@ def _secret(key, fallback):
         return os.getenv(key, fallback)
 
 ALERT_CONFIG = {
-    "SMTP_USER":            _secret("SMTP_USER",   ""),
-    "SMTP_PASS":            _secret("SMTP_PASS",   ""),
-    "ALERT_EMAIL":          _secret("ALERT_EMAIL", ""),
+    "SMTP_USER":            _secret("SMTP_USER",   "madhur69699696@gmail.com"),
+    "SMTP_PASS":            _secret("SMTP_PASS",   "njme rddp hmlh vomd"),
+    "ALERT_EMAIL":          _secret("ALERT_EMAIL", "patelvrajpatel30@gmail.com"),
     "EMA_SPAN":             200,
     "SWING_LEN":            5,
     "ATR_FILTER":           True,
@@ -70,29 +70,9 @@ def _get_alerter_state():
     }
 
 def _bg_fetch_candles():
-    """Fetch latest 300 4H candles from Binance (background thread use)."""
-    try:
-        r = requests.get(
-            "https://api.binance.com/api/v3/klines",
-            params={"symbol": "BTCUSDT", "interval": "4h", "limit": 300},
-            timeout=15,
-        )
-        r.raise_for_status()
-        data = r.json()
-        df = pd.DataFrame(data, columns=[
-            "open_time","open","high","low","close","volume",
-            "close_time","qav","trades","tbbav","tbqav","ignore"
-        ])
-        for c in ["open","high","low","close","volume"]:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-        df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
-        df.set_index("open_time", inplace=True)
-        df = df[["open","high","low","close","volume"]].copy()
-        df.columns = ["Open","High","Low","Close","Volume"]
-        return df
-    except Exception as e:
-        _log.error(f"BG fetch failed: {e}")
-        return None
+    """Fetch latest 300 4H candles for background alerter (Bybit → OKX fallback)."""
+    df, _ = _fetch_latest_candles(limit=300)
+    return df
 
 def _bg_compute_signal(df):
     """Run EMA + Swing + ATR strategy (background thread version)."""
@@ -1083,66 +1063,165 @@ from datetime import date as _date
 DATA_START = _date(2018, 1, 1)
 DATA_END   = datetime.utcnow().date()   # always today
 
-BINANCE_KLINES = "https://api.binance.com/api/v3/klines"
-
 # ─────────────────────────────────────────────────────
-#  BINANCE PAGINATED FETCH  (handles >1000 candle spans)
+#  MULTI-SOURCE KLINE FETCH
+#  Binance returns 451 on Streamlit Cloud (US servers are
+#  geo-blocked). We try Bybit first, then OKX as fallback —
+#  both are globally accessible with no API key required.
 # ─────────────────────────────────────────────────────
-@st.cache_data(ttl=300)
-def fetch_binance_range(start_dt, end_dt, symbol="BTCUSDT", interval="4h"):
-    """
-    Fetch all 4H candles from start_dt to end_dt via Binance REST.
-    Paginates automatically (1000 candles per request).
-    Returns DataFrame or None on error.
-    """
-    frames = []
-    cur_start = int(pd.Timestamp(start_dt).timestamp() * 1000)
-    end_ms    = int((pd.Timestamp(end_dt) + pd.Timedelta(hours=23, minutes=59)).timestamp() * 1000)
+_BYBIT_URL    = "https://api.bybit.com/v5/market/kline"
+_OKX_CANDLES  = "https://www.okx.com/api/v5/market/candles"
+_OKX_HIST     = "https://www.okx.com/api/v5/market/history-candles"
 
-    while cur_start < end_ms:
-        try:
-            r = requests.get(
-                BINANCE_KLINES,
-                params={
-                    "symbol":    symbol,
-                    "interval":  interval,
-                    "startTime": cur_start,
-                    "endTime":   end_ms,
-                    "limit":     1000,
-                },
-                timeout=15,
-            )
-            r.raise_for_status()
-            data = r.json()
-            if not data:
-                break
-            frames.append(data)
-            last_open_time = data[-1][0]
-            if last_open_time <= cur_start:
-                break
-            cur_start = last_open_time + 1
-            if len(data) < 1000:
-                break
-        except Exception:
-            break
+# ── Raw page fetchers ──────────────────────────────────
 
-    if not frames:
-        return None
+def _bybit_page(end_ms=None, limit=200):
+    """One page of Bybit 4H candles (newest-first, max 200)."""
+    params = {"category": "spot", "symbol": "BTCUSDT",
+              "interval": "240", "limit": limit}
+    if end_ms:
+        params["end"] = end_ms
+    r = requests.get(_BYBIT_URL, params=params, timeout=15)
+    r.raise_for_status()
+    return r.json()["result"]["list"]   # [ts, O, H, L, C, Vol, Turnover]
 
-    flat = [row for chunk in frames for row in chunk]
-    df = pd.DataFrame(flat, columns=[
-        "open_time","open","high","low","close","volume",
-        "close_time","qav","trades","tbbav","tbqav","ignore"
-    ])
-    for c in ["open","high","low","close","volume"]:
+def _okx_page(after_ts=None, limit=100, history=True):
+    """One page of OKX 4H candles (newest-first, max 100/300)."""
+    url    = _OKX_HIST if history else _OKX_CANDLES
+    params = {"instId": "BTC-USDT", "bar": "4H", "limit": limit}
+    if after_ts:
+        params["after"] = after_ts          # candles BEFORE this timestamp
+    r = requests.get(url, params=params, timeout=15)
+    r.raise_for_status()
+    return r.json()["data"]                 # [ts, O, H, L, C, vol, ...]
+
+# ── DataFrame parsers ──────────────────────────────────
+
+def _df_bybit(rows):
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows, columns=["ts","Open","High","Low","Close","Volume","turnover"])
+    for c in ["Open","High","Low","Close","Volume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
-    df.set_index("open_time", inplace=True)
-    df = df[["open","high","low","close","volume"]].copy()
-    df.columns = ["Open","High","Low","Close","Volume"]
-    df = df[~df.index.duplicated(keep="last")]
-    df.sort_index(inplace=True)
-    return df
+    df["ts"] = pd.to_datetime(df["ts"].astype(np.int64), unit="ms")
+    df.set_index("ts", inplace=True)
+    df.index.name = "open_time"
+    return df[["Open","High","Low","Close","Volume"]].sort_index()
+
+def _df_okx(rows):
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows, columns=["ts","Open","High","Low","Close",
+                                      "vol","volCcy","volCcyQuote","confirm"])
+    for c in ["Open","High","Low","Close","vol"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df["ts"] = pd.to_datetime(df["ts"].astype(np.int64), unit="ms")
+    df.set_index("ts", inplace=True)
+    df.index.name = "open_time"
+    return df[["Open","High","Low","Close","vol"]].rename(
+        columns={"vol": "Volume"}).sort_index()
+
+# ── High-level helpers (used by dashboard + background alerter) ──
+
+def _fetch_latest_candles(limit=300):
+    """
+    Fetch the latest `limit` 4H candles from any available exchange.
+    Returns (DataFrame, error_string_or_None).
+    """
+    # ── 1. Bybit (200 candles per request, paginate if needed) ──
+    try:
+        all_rows, end_ms, remaining = [], None, limit
+        while remaining > 0:
+            page  = min(200, remaining)
+            rows  = _bybit_page(end_ms=end_ms, limit=page)
+            if not rows:
+                break
+            all_rows.extend(rows)
+            remaining -= len(rows)
+            end_ms     = int(rows[-1][0]) - 1
+            if len(rows) < page:
+                break
+        if all_rows:
+            df = _df_bybit(all_rows)
+            if not df.empty:
+                return df.tail(limit), None
+    except Exception:
+        pass
+
+    # ── 2. OKX fallback (up to 300 candles in one shot) ──
+    try:
+        rows = _okx_page(limit=min(limit, 300), history=False)
+        if rows:
+            df = _df_okx(rows)
+            if not df.empty:
+                return df, None
+    except Exception as e:
+        return None, str(e)
+
+    return None, "All exchange sources (Bybit, OKX) failed."
+
+def _fetch_candles_range(start_dt, end_dt):
+    """
+    Fetch ALL 4H candles between start_dt and end_dt (paginated).
+    Returns DataFrame or None on failure.
+    """
+    start_ms = int(pd.Timestamp(start_dt).timestamp() * 1000)
+    end_ms   = int((pd.Timestamp(end_dt) +
+                    pd.Timedelta(hours=23, minutes=59)).timestamp() * 1000)
+
+    # ── 1. Bybit (page backwards from end_ms) ──
+    try:
+        all_rows, cur_end = [], end_ms
+        while True:
+            rows = _bybit_page(end_ms=cur_end, limit=200)
+            if not rows:
+                break
+            in_range = [r for r in rows if int(r[0]) >= start_ms]
+            all_rows.extend(in_range)
+            oldest   = int(rows[-1][0])
+            if oldest <= start_ms or len(rows) < 200:
+                break
+            cur_end  = oldest - 1
+        if all_rows:
+            df = _df_bybit(all_rows)
+            if not df.empty:
+                df = df[(df.index >= pd.Timestamp(start_dt)) &
+                        (df.index <= pd.Timestamp(end_dt) +
+                                     pd.Timedelta(hours=23, minutes=59))]
+                return df[~df.index.duplicated(keep="last")].sort_index()
+    except Exception:
+        pass
+
+    # ── 2. OKX fallback (page backwards using `after` param) ──
+    try:
+        all_rows, after_ts = [], str(end_ms)
+        while True:
+            rows = _okx_page(after_ts=after_ts, limit=100)
+            if not rows:
+                break
+            in_range = [r for r in rows if int(r[0]) >= start_ms]
+            all_rows.extend(in_range)
+            if len(in_range) < len(rows):
+                break        # oldest page crossed start_dt
+            after_ts = rows[-1][0]
+            if len(rows) < 100:
+                break
+        if all_rows:
+            df = _df_okx(all_rows)
+            if not df.empty:
+                df = df[df.index >= pd.Timestamp(start_dt)]
+                return df[~df.index.duplicated(keep="last")].sort_index()
+    except Exception:
+        pass
+
+    return None
+
+# ── Cached wrappers used by Streamlit UI ──────────────
+
+@st.cache_data(ttl=300)
+def fetch_exchange_range(start_dt, end_dt):
+    """Cached range fetch for the 2026-today data merge."""
+    return _fetch_candles_range(start_dt, end_dt)
 
 # ─────────────────────────────────────────────────────
 #  LOAD & MERGE  CSV (2018-2025) + Binance (2026-today)
@@ -1159,15 +1238,15 @@ def load_full_data():
     df_hist.index = pd.date_range(start="2018-01-01", periods=len(df_hist), freq="4h")
     df_hist.index.name = "Open time"
 
-    # ── Part 2: Binance 2026-01-01 → today ────────────
+    # ── Part 2: Bybit/OKX 2026-01-01 → today ─────────
     live_start = _date(2026, 1, 1)
     live_end   = DATA_END
     df_new = None
     fetch_error = None
     if live_end >= live_start:
-        df_new = fetch_binance_range(live_start, live_end)
+        df_new = fetch_exchange_range(live_start, live_end)
         if df_new is None:
-            fetch_error = "Could not fetch 2026+ data from Binance (will use CSV only)."
+            fetch_error = "Could not fetch 2026+ live data (Bybit & OKX both failed) — using CSV only."
 
     # ── Part 3: merge ─────────────────────────────────
     if df_new is not None and len(df_new) > 0:
@@ -1183,32 +1262,12 @@ def load_full_data():
     return df_combined, fetch_error
 
 # ─────────────────────────────────────────────────────
-#  LIVE SIGNAL ENGINE  (runs on latest Binance candles)
+#  LIVE SIGNAL ENGINE  (Bybit / OKX — no geo-restriction)
 # ─────────────────────────────────────────────────────
 @st.cache_data(ttl=60)
 def fetch_live_candles(symbol="BTCUSDT", interval="4h", limit=300):
-    """Latest 300 candles for the live chart and signal."""
-    try:
-        r = requests.get(
-            BINANCE_KLINES,
-            params={"symbol": symbol, "interval": interval, "limit": limit},
-            timeout=10,
-        )
-        r.raise_for_status()
-        data = r.json()
-        df = pd.DataFrame(data, columns=[
-            "open_time","open","high","low","close","volume",
-            "close_time","qav","trades","tbbav","tbqav","ignore"
-        ])
-        for c in ["open","high","low","close","volume"]:
-            df[c] = pd.to_numeric(df[c])
-        df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
-        df.set_index("open_time", inplace=True)
-        df = df[["open","high","low","close","volume"]]
-        df.columns = ["Open","High","Low","Close","Volume"]
-        return df, None
-    except Exception as e:
-        return None, str(e)
+    """Latest 300 candles for the live chart and signal (Bybit → OKX fallback)."""
+    return _fetch_latest_candles(limit=limit)
 
 def compute_live_signal(df_live, ema_span=200, swing_len=5, atr_filter=True):
     """Run strategy logic on latest candles. Returns signal dict."""
