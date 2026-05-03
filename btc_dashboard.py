@@ -1437,7 +1437,7 @@ with st.sidebar:
     st.markdown('<div class="cyber-divider"></div>', unsafe_allow_html=True)
     st.markdown("### 💰 Risk Management")
     initial_capital = st.number_input("Initial Capital ($)", 1000, 1_000_000, 10_000, step=1000)
-    risk_pct        = st.slider("Risk per Trade (%)", 0.25, 5.0, 1.0, step=0.25)
+    risk_pct        = st.slider("Risk per Trade (%)", 0.25, 5.0, 1.5, step=0.25)
     rr              = st.slider("Reward / Risk Ratio", 1.0, 8.0, 3.0, step=0.5)
     max_leverage    = st.slider("Max Leverage", 1, 10, 3)
     fee             = st.number_input("Fee per side (%)", 0.0, 0.5, 0.04, step=0.01, format="%.2f") / 100
