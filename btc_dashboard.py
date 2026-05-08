@@ -1477,9 +1477,19 @@ with st.sidebar:
 
     st.markdown('<div class="cyber-divider"></div>', unsafe_allow_html=True)
     st.markdown("### 📧 Email Alerts")
-    smtp_user   = st.text_input("Gmail address",      value=ALERT_CONFIG["SMTP_USER"],   type="default")
-    smtp_pass   = st.text_input("Gmail App Password", value=ALERT_CONFIG["SMTP_PASS"],   type="password")
-    alert_email = st.text_input("Send alerts to",     value=ALERT_CONFIG["ALERT_EMAIL"], type="default")
+    smtp_user   = st.text_input("Gmail address",      value="", type="default")
+    smtp_pass   = st.text_input("Gmail App Password", value="", type="password")
+    alert_email = st.text_input("Send alerts to",     value="", type="default")
+    # Secure: Select credentials from user input, or fallback to secrets/env if blank
+    def get_secret(key, fallback=""):
+       try:
+          return st.secrets[key]
+       except Exception:
+          return os.getenv(key, fallback)
+
+    active_smtp_user   = smtp_user   if smtp_user   else get_secret("SMTP_USER")
+    active_smtp_pass   = smtp_pass   if smtp_pass   else get_secret("SMTP_PASS")
+    active_alert_email = alert_email if alert_email else get_secret("ALERT_EMAIL")
     st.markdown(
         '<div style="font-family:var(--font-mono);font-size:9px;color:var(--text-dim);line-height:1.8;margin-top:4px;">'  
         'Use a Gmail App Password (not your main password).<br>'  
@@ -1686,7 +1696,7 @@ with tab_live:
                         st.error("\u26a0\ufe0f Fill in Gmail address, App Password and recipient in the sidebar first.")
                     else:
                         with st.spinner("Sending email\u2026"):
-                            ok, msg_out = send_signal_email(smtp_user, smtp_pass, alert_email, sig)
+                            ok, msg_out = send_signal_email(active_smtp_user, active_smtp_pass, active_alert_email, sig)
                         if ok:
                             st.success(f"\u2705 Email sent to {alert_email}")
                         else:
