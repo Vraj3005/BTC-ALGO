@@ -28,6 +28,20 @@ from streamlit_autorefresh import st_autorefresh
 #  For Streamlit Cloud → add to App Secrets (Settings):
 
 # ─────────────────────────────────────────────────────
+# =========================
+# Secure credentials usage (add this AFTER your sidebar code)
+# =========================
+def get_secret(key, fallback=""):
+    try:
+        return st.secrets[key]
+    except Exception:
+        return os.getenv(key, fallback)
+
+# Select which credentials to use (prefer user form input if present, else use secret)
+active_smtp_user = smtp_user if smtp_user else get_secret("SMTP_USER")
+active_smtp_pass = smtp_pass if smtp_pass else get_secret("SMTP_PASS")
+active_alert_email = alert_email if alert_email else get_secret("ALERT_EMAIL")
+
 def _secret(key, fallback):
     try:
         return st.secrets[key]
