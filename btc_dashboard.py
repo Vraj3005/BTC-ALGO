@@ -5,7 +5,7 @@ import random
 import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import io
 import requests
 import smtplib
@@ -203,7 +203,7 @@ def start_background_alerter():
         _log.info("▶ Background alerter thread started.")
         while True:
             try:
-                state["last_check"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+                state["last_check"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
                 df = _bg_fetch_candles()
                 sig = _bg_compute_signal(df)
                 state["last_signal"] = sig["signal"]
@@ -249,9 +249,6 @@ st.set_page_config(
 
 # Auto-refresh every 60 seconds — keeps the page alive and pulls fresh signals
 _refresh_count = st_autorefresh(interval=60_000, limit=None, key="live_refresh")
-
-# Launch background alerter (one-time; survives page refreshes via cache_resource)
-_alerter_state = start_background_alerter()
 
 # ─────────────────────────────────────────────────────
 #  GLOBAL CSS — Premium Cyber-Finance Theme
@@ -1007,6 +1004,7 @@ def backtest(df, swing_len, risk_pct, rr, initial_capital,
                         "size":         round(size, 6),
                         "risk_amount":  round(risk_amt_saved, 6),
                         "R":            round(R, 4),
+                        "status":       "CLOSED",
                     })
                 position = None
 
@@ -1018,6 +1016,29 @@ def backtest(df, swing_len, risk_pct, rr, initial_capital,
         max_dd = max(max_dd, dd)
         if max_dd > max_dd_allowed:
             return None
+
+    if position is not None and detailed:
+        last_row = df.iloc[-1]
+        exit_price = last_row["Close"]
+        fee_cost = size * exit_price * fee * 2
+        pnl = (
+            size * (exit_price - entry) - fee_cost
+            if position == "long"
+            else size * (entry - exit_price) - fee_cost
+        )
+        R = pnl / (size * abs(entry - sl_price)) if size * abs(entry - sl_price) > 0 else 0
+        trade_records.append({
+            "entry_time":   entry_time,
+            "entry_price":  entry_price,
+            "exit_time":    df.index[-1],
+            "exit_price":   exit_price,
+            "type":         position,
+            "pnl_currency": round(pnl, 4),
+            "size":         round(size, 6),
+            "risk_amount":  round(risk_amt_saved, 6),
+            "R":            round(R, 4),
+            "status":       "OPEN",
+        })
 
     if trades < 10:
         return None
@@ -1061,7 +1082,7 @@ def monte_carlo(R_list, initial_capital, risk_pct, runs=1000):
 # ─────────────────────────────────────────────────────
 from datetime import date as _date
 DATA_START = _date(2018, 1, 1)
-DATA_END   = datetime.utcnow().date()   # always today
+DATA_END   = datetime.now(timezone.utc).date()   # always today
 
 # ─────────────────────────────────────────────────────
 #  MULTI-SOURCE KLINE FETCH
@@ -1408,6 +1429,10 @@ def send_signal_email(smtp_user, smtp_pass, to_email, signal_data):
 
 
 # ─────────────────────────────────────────────────────
+# Launch background alerter (one-time; survives page refreshes via cache_resource)
+_alerter_state = start_background_alerter()
+
+# ─────────────────────────────────────────────────────
 #  LOAD FULL DATASET (CSV 2018-2025 + Binance 2026-today)
 # ─────────────────────────────────────────────────────
 df_raw, _fetch_warn = load_full_data()
@@ -1464,25 +1489,16 @@ with st.sidebar:
     st.markdown('<div class="cyber-divider"></div>', unsafe_allow_html=True)
 
     st.markdown('<div class="cyber-divider"></div>', unsafe_allow_html=True)
-    st.markdown("### 📧 Email Alerts")
-    smtp_user   = st.text_input("Gmail address",      value="", type="default")
-    smtp_pass   = st.text_input("Gmail App Password", value="", type="password")
-    alert_email = st.text_input("Send alerts to",     value="", type="default")
-    # Secure: Select credentials from user input, or fallback to secrets/env if blank
+    # Secure: Use only backend credentials so no one can see them
     def get_secret(key, fallback=""):
        try:
           return st.secrets[key]
        except Exception:
           return os.getenv(key, fallback)
 
-    active_smtp_user   = smtp_user   if smtp_user   else get_secret("SMTP_USER")
-    active_smtp_pass   = smtp_pass   if smtp_pass   else get_secret("SMTP_PASS")
-    active_alert_email = alert_email if alert_email else get_secret("ALERT_EMAIL")
-    st.markdown(
-        '<div style="font-family:var(--font-mono);font-size:9px;color:var(--text-dim);line-height:1.8;margin-top:4px;">'  
-        'Use a Gmail App Password (not your main password).<br>'  
-        'Enable 2FA → Google Account → Security → App Passwords.</div>',
-        unsafe_allow_html=True)
+    active_smtp_user   = get_secret("SMTP_USER")
+    active_smtp_pass   = get_secret("SMTP_PASS")
+    active_alert_email = get_secret("ALERT_EMAIL")
 
     st.markdown('<div class="cyber-divider"></div>', unsafe_allow_html=True)
     run_btn = st.button("▶  RUN BACKTEST",    use_container_width=True)
@@ -1680,13 +1696,13 @@ with tab_live:
         with col_em1:
             if s_type in ("LONG", "SHORT"):
                 if st.button("\U0001f4e8  Send Signal Email Now", use_container_width=True):
-                    if not smtp_user or not smtp_pass or not alert_email:
-                        st.error("\u26a0\ufe0f Fill in Gmail address, App Password and recipient in the sidebar first.")
+                    if not active_smtp_user or not active_smtp_pass or not active_alert_email:
+                        st.error("\u26a0\ufe0f Credentials not found in environment/secrets. Cannot send email.")
                     else:
                         with st.spinner("Sending email\u2026"):
                             ok, msg_out = send_signal_email(active_smtp_user, active_smtp_pass, active_alert_email, sig)
                         if ok:
-                            st.success(f"\u2705 Email sent to {alert_email}")
+                            st.success(f"\u2705 Email sent to {active_alert_email}")
                         else:
                             st.error(f"\u274c Failed: {msg_out}")
             else:
@@ -1698,7 +1714,7 @@ with tab_live:
         with col_em2:
             st.markdown(
                 '<div class="info-box"><b>Auto-refresh:</b> Page reloads every 60 s.<br>'
-                'Fill sidebar Gmail details to send alerts when a signal appears.</div>',
+                'Alerts are sent automatically if credentials are set in secrets.</div>',
                 unsafe_allow_html=True,
             )
 
@@ -1775,13 +1791,13 @@ with tab_live:
                 })
 
                 # AUTO-SEND email for every new signal
-                if smtp_user and smtp_pass and alert_email:
+                if active_smtp_user and active_smtp_pass and active_alert_email:
                     with st.spinner("📧 New signal — sending email…"):
-                        ok, msg_out = send_signal_email(smtp_user, smtp_pass, alert_email, sig)
+                        ok, msg_out = send_signal_email(active_smtp_user, active_smtp_pass, active_alert_email, sig)
                     if ok:
                         st.session_state["signal_history"][-1]["Email"] = "✅ Sent"
                         st.session_state["last_auto_email_time"] = cur_time_str
-                        st.success(f"✅ Auto-email sent to {alert_email} — {s_type} @ {cur_time_str}")
+                        st.success(f"✅ Auto-email sent to {active_alert_email} — {s_type} @ {cur_time_str}")
                     else:
                         st.session_state["signal_history"][-1]["Email"] = f"❌ {msg_out}"
                         st.warning(f"⚠️ Auto-email failed: {msg_out}")
@@ -1794,7 +1810,7 @@ with tab_live:
         else:
             st.markdown(
                 '<div class="info-box">No signals yet this session. '
-                'Signals log automatically; email fires if credentials are set in sidebar.</div>',
+                'Signals log automatically; email fires if backend credentials are set.</div>',
                 unsafe_allow_html=True,
             )
 
@@ -2514,11 +2530,11 @@ with tab_trades:
         """, unsafe_allow_html=True)
     else:
         trades_df           = pd.DataFrame(st.session_state["last_result"]["trade_records"])
-        trades_df["Result"] = trades_df["pnl_currency"].apply(lambda x: "WIN" if x > 0 else "LOSS")
+        trades_df["Result"] = trades_df.apply(lambda x: "OPEN" if x.get("status") == "OPEN" else ("WIN" if x["pnl_currency"] > 0 else "LOSS"), axis=1)
 
         col_f1, col_f2, col_f3 = st.columns(3)
         type_filter   = col_f1.multiselect("Direction", ["long","short"], default=["long","short"])
-        result_filter = col_f2.multiselect("Result",    ["WIN","LOSS"],   default=["WIN","LOSS"])
+        result_filter = col_f2.multiselect("Result",    ["WIN","LOSS","OPEN"], default=["WIN","LOSS","OPEN"])
         sort_by       = col_f3.selectbox("Sort by", ["entry_time","pnl_currency","R"], index=0)
 
         filtered = trades_df[
@@ -2543,11 +2559,11 @@ with tab_trades:
 
         st.markdown("<br>", unsafe_allow_html=True)
 
-        display_cols   = ["type","entry_time","entry_price","exit_time","exit_price","pnl_currency","R","size","risk_amount"]
+        display_cols   = ["status","type","entry_time","entry_price","exit_time","exit_price","pnl_currency","R","size","risk_amount"]
         available_cols = [c for c in display_cols if c in filtered.columns]
         st.dataframe(
             filtered[available_cols].rename(columns={
-                "type": "Side", "entry_time": "Entry Time", "entry_price": "Entry $",
+                "status": "Status", "type": "Side", "entry_time": "Entry Time", "entry_price": "Entry $",
                 "exit_time": "Exit Time", "exit_price": "Exit $",
                 "pnl_currency": "PnL ($)", "R": "R Multiple",
                 "size": "Position Size", "risk_amount": "Risk ($)",
