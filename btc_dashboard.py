@@ -40,9 +40,10 @@ ALERT_CONFIG = {
     "SMTP_USER":            _secret("SMTP_USER",   ""),
     "SMTP_PASS":            _secret("SMTP_PASS",   ""),
     "ALERT_EMAIL":          _secret("ALERT_EMAIL", "don911911911@gmail.com"),
-    "EMA_SPAN":             200,
-    "SWING_LEN":            7,
-    "ATR_FILTER":           True,
+    "FAST_SPAN":            20,
+    "SLOW_SPAN":            50,
+    "TREND_SPAN":           200,
+    "ATR_MULT":             1.5,
     "RR":                   3.0,
     "CHECK_EVERY_SECONDS":  1800,   # check every 30 min
 }
@@ -77,51 +78,67 @@ def _bg_fetch_candles():
     return df
 
 def _bg_compute_signal(df):
-    """Run EMA + Swing + ATR strategy (background thread version)."""
+    """Run EMA Crossover + MACD + RSI + ATR strategy (background thread version)."""
     cfg = ALERT_CONFIG
-    if df is None or len(df) < cfg["EMA_SPAN"] + 30:
+    if df is None or len(df) < cfg["TREND_SPAN"] + 50:
         return {"signal": "NO DATA"}
-    df = df.copy()
-    df["EMA"] = df["Close"].ewm(span=cfg["EMA_SPAN"], adjust=False).mean()
-    tr = pd.concat([
-        df["High"] - df["Low"],
-        (df["High"] - df["Close"].shift()).abs(),
-        (df["Low"]  - df["Close"].shift()).abs(),
-    ], axis=1).max(axis=1)
-    df["ATR"] = tr.rolling(14).mean()
-    n   = cfg["SWING_LEN"]
-    sh  = df["High"] == df["High"].rolling(n * 2 + 1, center=True).max()
-    sl_ = df["Low"]  == df["Low"].rolling(n * 2 + 1, center=True).min()
-    atr_med = df["ATR"].median()
-    last    = df.iloc[-1]
-    
-    result  = {
-        "signal": "FLAT", "price": round(float(last["Close"]), 2),
-        "ema": round(float(last["EMA"]), 2), "atr": round(float(last["ATR"]), 2),
-        "atr_median": round(float(atr_med), 2), "time": df.index[-1],
-        "reason": "", "sl": None, "tp": None,
-    }
-    if cfg["ATR_FILTER"] and last["ATR"] < atr_med:
-        result["reason"] = "ATR below median — low volatility"
-        return result
         
-    confirmed_idx = -(n + 1)
-    if sl_.iloc[confirmed_idx] and last["Close"] > last["EMA"]:
-        stop_w = df.iloc[confirmed_idx - n : confirmed_idx]
-        stop = float(stop_w["Low"].min())
-        risk = last["Close"] - stop
-        if risk > 0:
-            result.update({"signal": "LONG", "sl": round(stop, 2),
-                           "tp": round(float(last["Close"]) + risk * cfg["RR"], 2),
-                           "reason": "Swing Low confirmed + Price above EMA200"})
-    elif sh.iloc[confirmed_idx] and last["Close"] < last["EMA"]:
-        stop_w = df.iloc[confirmed_idx - n : confirmed_idx]
-        stop = float(stop_w["High"].max())
-        risk = stop - last["Close"]
-        if risk > 0:
-            result.update({"signal": "SHORT", "sl": round(stop, 2),
-                           "tp": round(float(last["Close"]) - risk * cfg["RR"], 2),
-                           "reason": "Swing High confirmed + Price below EMA200"})
+    df = df.copy()
+    df = add_indicators(df, fast_span=cfg["FAST_SPAN"], slow_span=cfg["SLOW_SPAN"], trend_span=cfg["TREND_SPAN"])
+    
+    last_idx = -2
+    prev_idx = -3
+    
+    last_row = df.iloc[last_idx]
+    prev_row = df.iloc[prev_idx]
+    current_row = df.iloc[-1]
+    
+    long_cross = (prev_row["EMA_Fast"] <= prev_row["EMA_Slow"]) and (last_row["EMA_Fast"] > last_row["EMA_Slow"])
+    short_cross = (prev_row["EMA_Fast"] >= prev_row["EMA_Slow"]) and (last_row["EMA_Fast"] < last_row["EMA_Slow"])
+    
+    result = {
+        "signal": "FLAT", "price": round(float(current_row["Close"]), 2),
+        "ema": round(float(last_row["EMA_Trend"]), 2), "atr": round(float(last_row["ATR"]), 2),
+        "atr_median": round(float(df["ATR"].median()), 2), "time": df.index[last_idx],
+        "reason": "Flat market / No crossover signals", "sl": None, "tp": None,
+    }
+    
+    macd_bullish = last_row["MACD_Hist"] > 0
+    macd_bearish = last_row["MACD_Hist"] < 0
+    rsi_bullish = 50 <= last_row["RSI"] <= 65
+    rsi_bearish = 35 <= last_row["RSI"] <= 50
+    
+    if long_cross:
+        if last_row["Close"] > last_row["EMA_Trend"]:
+            if macd_bullish and rsi_bullish:
+                atr_val = float(last_row["ATR"])
+                stop = float(current_row["Close"] - atr_val * cfg["ATR_MULT"])
+                risk = current_row["Close"] - stop
+                result.update({
+                    "signal": "LONG", "sl": round(stop, 2),
+                    "tp": round(float(current_row["Close"]) + risk * cfg["RR"], 2),
+                    "reason": "EMA 20/50 Bullish Cross + MACD/RSI Confirmed"
+                })
+            else:
+                result["reason"] = f"Bullish Cross rejected by MACD/RSI (RSI: {last_row['RSI']:.1f}, Hist: {last_row['MACD_Hist']:.4f})"
+        else:
+            result["reason"] = "Bullish Cross below EMA Trend Baseline"
+    elif short_cross:
+        if last_row["Close"] < last_row["EMA_Trend"]:
+            if macd_bearish and rsi_bearish:
+                atr_val = float(last_row["ATR"])
+                stop = float(current_row["Close"] + atr_val * cfg["ATR_MULT"])
+                risk = stop - current_row["Close"]
+                result.update({
+                    "signal": "SHORT", "sl": round(stop, 2),
+                    "tp": round(float(current_row["Close"]) - risk * cfg["RR"], 2),
+                    "reason": "EMA 20/50 Bearish Cross + MACD/RSI Confirmed"
+                })
+            else:
+                result["reason"] = f"Bearish Cross rejected by MACD/RSI (RSI: {last_row['RSI']:.1f}, Hist: {last_row['MACD_Hist']:.4f})"
+        else:
+            result["reason"] = "Bearish Cross above EMA Trend Baseline"
+            
     return result
 
 def _send_raw_email(subject, html):
@@ -1092,20 +1109,34 @@ def load_csv():
 # ─────────────────────────────────────────────────────
 #  INDICATORS
 # ─────────────────────────────────────────────────────
-def add_indicators(df, ema_span=200, atr_period=14):
+def add_indicators(df, fast_span=20, slow_span=50, trend_span=200, atr_period=14):
     df = df.copy()
-    df["EMA200"] = df["Close"].ewm(span=ema_span, adjust=False).mean()
+    df["EMA_Fast"]  = df["Close"].ewm(span=fast_span, adjust=False).mean()
+    df["EMA_Slow"]  = df["Close"].ewm(span=slow_span, adjust=False).mean()
+    df["EMA_Trend"] = df["Close"].ewm(span=trend_span, adjust=False).mean()
+    
+    # ATR Calculation
     tr = pd.concat([
         df["High"] - df["Low"],
         (df["High"] - df["Close"].shift()).abs(),
         (df["Low"] - df["Close"].shift()).abs(),
     ], axis=1).max(axis=1)
     df["ATR"] = tr.rolling(atr_period).mean()
+    
+    # RSI Calculation
     delta = df["Close"].diff()
     gain  = delta.clip(lower=0).rolling(14).mean()
     loss  = (-delta.clip(upper=0)).rolling(14).mean()
     rs    = gain / loss.replace(0, np.nan)
     df["RSI"]      = 100 - (100 / (1 + rs))
+    
+    # MACD Calculation
+    ema12 = df["Close"].ewm(span=12, adjust=False).mean()
+    ema26 = df["Close"].ewm(span=26, adjust=False).mean()
+    df["MACD"] = ema12 - ema26
+    df["MACD_Signal"] = df["MACD"].ewm(span=9, adjust=False).mean()
+    df["MACD_Hist"] = df["MACD"] - df["MACD_Signal"]
+    
     df["BB_mid"]   = df["Close"].rolling(20).mean()
     df["BB_upper"] = df["BB_mid"] + 2 * df["Close"].rolling(20).std()
     df["BB_lower"] = df["BB_mid"] - 2 * df["Close"].rolling(20).std()
@@ -1122,9 +1153,13 @@ def swings(data, n):
 # ─────────────────────────────────────────────────────
 #  BACKTEST CORE
 # ─────────────────────────────────────────────────────
-def backtest(df, swing_len, risk_pct, rr, initial_capital,
+def backtest(df, fast_span, risk_pct, rr, initial_capital,
              max_leverage, fee, slippage, max_dd_allowed,
-             atr_filter=True, detailed=False):
+             slow_span=None, trend_span=200, atr_mult=1.5, detailed=False):
+    # Dynamic defaults for optimization compatibility
+    if slow_span is None:
+        slow_span = int(fast_span * 2.5)
+        
     capital = float(initial_capital)
     peak = capital
     max_dd = 0
@@ -1136,23 +1171,70 @@ def backtest(df, swing_len, risk_pct, rr, initial_capital,
     trade_records = []
     entry_time = entry_price = risk_amt_saved = None
 
-    sh, slw = swings(df, swing_len)
-    atr_median = df["ATR"].median()
+    # Compute indicators for this backtest run
+    df = add_indicators(df, fast_span=fast_span, slow_span=slow_span, trend_span=trend_span)
 
-    for i in range(swing_len * 2, len(df)):
+    for i in range(trend_span + 30, len(df)):
         row = df.iloc[i]
-        if atr_filter and row["ATR"] < atr_median:
-            if detailed:
-                equity_curve.append((df.index[i], capital))
-            continue
-
-        if position is None:
+        prev_row = df.iloc[i-1]
+        
+        if position is not None:
+            exit_price = None
+            if position == "long":
+                if row["Low"] <= sl_price:
+                    exit_price = sl_price
+                elif row["High"] >= tp_price:
+                    exit_price = tp_price
+            else:
+                if row["High"] >= sl_price:
+                    exit_price = sl_price
+                elif row["Low"] <= tp_price:
+                    exit_price = tp_price
+                    
+            if exit_price is not None:
+                fee_cost = size * exit_price * fee * 2
+                pnl = (
+                    size * (exit_price - entry) - fee_cost
+                    if position == "long"
+                    else size * (entry - exit_price) - fee_cost
+                )
+                R = pnl / (size * abs(entry - sl_price)) if size * abs(entry - sl_price) > 0 else 0
+                capital += pnl
+                capital = max(capital, 1.0)
+                if pnl > 0: wins += 1
+                R_list.append(R)
+                
+                if detailed:
+                    trade_records.append({
+                        "entry_time": entry_time,
+                        "entry_price": entry_price,
+                        "exit_time": df.index[i],
+                        "exit_price": exit_price,
+                        "type": position,
+                        "pnl_currency": round(pnl, 4),
+                        "size": round(size, 6),
+                        "risk_amount": round(risk_amt_saved, 6),
+                        "R": round(R, 4),
+                        "status": "CLOSED",
+                    })
+                position = None
+        else:
             risk_amount = capital * (risk_pct / 100)
-
-            if slw.iloc[i] and row["Close"] > row["EMA200"]:
+            
+            # Crossover triggers
+            long_cross = (prev_row["EMA_Fast"] <= prev_row["EMA_Slow"]) and (row["EMA_Fast"] > row["EMA_Slow"])
+            short_cross = (prev_row["EMA_Fast"] >= prev_row["EMA_Slow"]) and (row["EMA_Fast"] < row["EMA_Slow"])
+            
+            macd_bullish = row["MACD_Hist"] > 0
+            macd_bearish = row["MACD_Hist"] < 0
+            rsi_bullish = 50 <= row["RSI"] <= 65
+            rsi_bearish = 35 <= row["RSI"] <= 50
+            
+            if long_cross and row["Close"] > row["EMA_Trend"] and macd_bullish and rsi_bullish:
                 entry_p = row["Close"] * (1 + slippage)
-                stop    = df["Low"].iloc[i - swing_len:i].min()
-                risk    = entry_p - stop
+                atr_val = row["ATR"]
+                stop = entry_p - atr_val * atr_mult
+                risk = entry_p - stop
                 if risk <= 0:
                     if detailed: equity_curve.append((df.index[i], capital))
                     continue
@@ -1166,11 +1248,12 @@ def backtest(df, swing_len, risk_pct, rr, initial_capital,
                     entry_time     = df.index[i]
                     entry_price    = row["Close"]
                     risk_amt_saved = risk_amount
-
-            elif sh.iloc[i] and row["Close"] < row["EMA200"]:
+                    
+            elif short_cross and row["Close"] < row["EMA_Trend"] and macd_bearish and rsi_bearish:
                 entry_p = row["Close"] * (1 - slippage)
-                stop    = df["High"].iloc[i - swing_len:i].max()
-                risk    = stop - entry_p
+                atr_val = row["ATR"]
+                stop = entry_p + atr_val * atr_mult
+                risk = stop - entry_p
                 if risk <= 0:
                     if detailed: equity_curve.append((df.index[i], capital))
                     continue
@@ -1184,56 +1267,16 @@ def backtest(df, swing_len, risk_pct, rr, initial_capital,
                     entry_time     = df.index[i]
                     entry_price    = row["Close"]
                     risk_amt_saved = risk_amount
-        else:
-            exit_price = None
-            if position == "long":
-                if row["Low"] <= sl_price:
-                    exit_price = sl_price
-                elif row["High"] >= tp_price:
-                    exit_price = tp_price
-            else:
-                if row["High"] >= sl_price:
-                    exit_price = sl_price
-                elif row["Low"] <= tp_price:
-                    exit_price = tp_price
-
-            if exit_price is not None:
-                fee_cost = size * exit_price * fee * 2
-                pnl = (
-                    size * (exit_price - entry) - fee_cost
-                    if position == "long"
-                    else size * (entry - exit_price) - fee_cost
-                )
-                R = pnl / (size * abs(entry - sl_price)) if size * abs(entry - sl_price) > 0 else 0
-                capital += pnl
-                capital  = max(capital, 1)
-                if pnl > 0: wins += 1
-                R_list.append(R)
-
-                if detailed:
-                    trade_records.append({
-                        "entry_time":   entry_time,
-                        "entry_price":  entry_price,
-                        "exit_time":    df.index[i],
-                        "exit_price":   exit_price,
-                        "type":         position,
-                        "pnl_currency": round(pnl, 4),
-                        "size":         round(size, 6),
-                        "risk_amount":  round(risk_amt_saved, 6),
-                        "R":            round(R, 4),
-                        "status":       "CLOSED",
-                    })
-                position = None
-
+                    
         if detailed:
             equity_curve.append((df.index[i], capital))
-
-        dd   = (peak - capital) / peak if peak > 0 else 0
+            
+        dd = (peak - capital) / peak if peak > 0 else 0
         peak = max(peak, capital)
         max_dd = max(max_dd, dd)
         if max_dd > max_dd_allowed:
             return None
-
+            
     if position is not None and detailed:
         last_row = df.iloc[-1]
         exit_price = last_row["Close"]
@@ -1256,15 +1299,15 @@ def backtest(df, swing_len, risk_pct, rr, initial_capital,
             "R":            round(R, 4),
             "status":       "OPEN",
         })
-
-    if trades < 10:
+        
+    if trades < 3: # Lower threshold since crossovers are more selective
         return None
-
+        
     return_pct = (capital / initial_capital - 1) * 100
-    win_rate   = wins / trades * 100 if trades > 0 else 0
-
+    win_rate = wins / trades * 100 if trades > 0 else 0
+    
     result = {
-        "Swing":        swing_len,
+        "Swing":        fast_span, # Mapped to Swing for dashboard compatibility
         "Risk%":        risk_pct,
         "RR":           rr,
         "Return%":      return_pct,
@@ -1276,7 +1319,7 @@ def backtest(df, swing_len, risk_pct, rr, initial_capital,
         "R_List":       R_list,
     }
     if detailed:
-        result["equity_curve"]  = equity_curve
+        result["equity_curve"] = equity_curve
         result["trade_records"] = trade_records
     return result
 
@@ -1507,63 +1550,76 @@ def fetch_live_candles(symbol="BTCUSDT", interval="4h", limit=300):
     """Latest 300 candles for the live chart and signal (Bybit → OKX fallback)."""
     return _fetch_latest_candles(limit=limit)
 
-def compute_live_signal(df_live, ema_span=200, swing_len=7, atr_filter=True):
-    """Run strategy logic on latest candles. Returns signal dict."""
-    if df_live is None or len(df_live) < ema_span + 30:
+def compute_live_signal(df_live, fast_span=20, slow_span=50, trend_span=200, atr_mult=1.5, rr=3.0):
+    """Run EMA crossover strategy on live candles. Returns signal dict."""
+    if df_live is None or len(df_live) < trend_span + 50:
         return {"signal": "NO DATA", "reason": "Not enough candles",
                 "price": 0, "ema": 0, "atr": 0, "atr_median": 0,
                 "time": pd.Timestamp.utcnow(), "sl": None, "tp": None}
 
     df = df_live.copy()
-    df["EMA"] = df["Close"].ewm(span=ema_span, adjust=False).mean()
-    tr = pd.concat([
-        df["High"] - df["Low"],
-        (df["High"] - df["Close"].shift()).abs(),
-        (df["Low"]  - df["Close"].shift()).abs(),
-    ], axis=1).max(axis=1)
-    df["ATR"] = tr.rolling(14).mean()
-    sh = df["High"] == df["High"].rolling(swing_len * 2 + 1, center=True).max()
-    sl_sw = df["Low"]  == df["Low"].rolling(swing_len * 2 + 1, center=True).min()
-
-    atr_median   = df["ATR"].median()
-    last         = df.iloc[-1]
-
+    df = add_indicators(df, fast_span=fast_span, slow_span=slow_span, trend_span=trend_span)
+    
+    last_idx = -2
+    prev_idx = -3
+    
+    last_row = df.iloc[last_idx]
+    prev_row = df.iloc[prev_idx]
+    current_row = df.iloc[-1]
+    
+    long_cross = (prev_row["EMA_Fast"] <= prev_row["EMA_Slow"]) and (last_row["EMA_Fast"] > last_row["EMA_Slow"])
+    short_cross = (prev_row["EMA_Fast"] >= prev_row["EMA_Slow"]) and (last_row["EMA_Fast"] < last_row["EMA_Slow"])
+    
     result = {
         "signal":     "FLAT",
-        "price":      round(float(last["Close"]), 2),
-        "ema":        round(float(last["EMA"]), 2),
-        "atr":        round(float(last["ATR"]), 2),
-        "atr_median": round(float(atr_median), 2),
-        "time":       df.index[-1],
-        "reason":     "",
+        "price":      round(float(current_row["Close"]), 2),
+        "ema":        round(float(last_row["EMA_Trend"]), 2),
+        "atr":        round(float(last_row["ATR"]), 2),
+        "atr_median": round(float(df["ATR"].median()), 2),
+        "time":       df.index[last_idx],
+        "reason":     "Flat market / No crossover signals",
         "sl":         None,
         "tp":         None,
     }
 
-    if atr_filter and last["ATR"] < atr_median:
-        result["reason"] = "ATR below median — low volatility, no trade"
-        return result
+    macd_bullish = last_row["MACD_Hist"] > 0
+    macd_bearish = last_row["MACD_Hist"] < 0
+    rsi_bullish = 50 <= last_row["RSI"] <= 65
+    rsi_bearish = 35 <= last_row["RSI"] <= 50
 
-    confirmed_idx = -(swing_len + 1)
-    if sl_sw.iloc[confirmed_idx] and last["Close"] > last["EMA"]:
-        stop_w = df.iloc[confirmed_idx - swing_len : confirmed_idx]
-        stop = float(stop_w["Low"].min())
-        risk = last["Close"] - stop
-        if risk > 0:
-            result["signal"] = "LONG"
-            result["sl"]     = round(stop, 2)
-            result["tp"]     = round(float(last["Close"]) + risk * 3.0, 2)
-            result["reason"] = "Swing Low confirmed + Price above EMA200"
-
-    elif sh.iloc[confirmed_idx] and last["Close"] < last["EMA"]:
-        stop_w = df.iloc[confirmed_idx - swing_len : confirmed_idx]
-        stop = float(stop_w["High"].max())
-        risk = stop - last["Close"]
-        if risk > 0:
-            result["signal"] = "SHORT"
-            result["sl"]     = round(stop, 2)
-            result["tp"]     = round(float(last["Close"]) - risk * 3.0, 2)
-            result["reason"] = "Swing High confirmed + Price below EMA200"
+    if long_cross:
+        if last_row["Close"] > last_row["EMA_Trend"]:
+            if macd_bullish and rsi_bullish:
+                atr_val = float(last_row["ATR"])
+                stop = float(current_row["Close"] - atr_val * atr_mult)
+                risk = current_row["Close"] - stop
+                result.update({
+                    "signal": "LONG",
+                    "sl":     round(stop, 2),
+                    "tp":     round(float(current_row["Close"]) + risk * rr, 2),
+                    "reason": "EMA 20/50 Bullish Cross + MACD/RSI Confirmed",
+                })
+            else:
+                result["reason"] = f"Bullish Cross rejected by MACD/RSI (RSI: {last_row['RSI']:.1f}, Hist: {last_row['MACD_Hist']:.4f})"
+        else:
+            result["reason"] = "Bullish Cross occurred below EMA Trend Baseline"
+            
+    elif short_cross:
+        if last_row["Close"] < last_row["EMA_Trend"]:
+            if macd_bearish and rsi_bearish:
+                atr_val = float(last_row["ATR"])
+                stop = float(current_row["Close"] + atr_val * atr_mult)
+                risk = stop - current_row["Close"]
+                result.update({
+                    "signal": "SHORT",
+                    "sl":     round(stop, 2),
+                    "tp":     round(float(current_row["Close"]) - risk * rr, 2),
+                    "reason": "EMA 20/50 Bearish Cross + MACD/RSI Confirmed",
+                })
+            else:
+                result["reason"] = f"Bearish Cross rejected by MACD/RSI (RSI: {last_row['RSI']:.1f}, Hist: {last_row['MACD_Hist']:.4f})"
+        else:
+            result["reason"] = "Bearish Cross occurred above EMA Trend Baseline"
 
     return result
 
@@ -1676,9 +1732,12 @@ with st.sidebar:
     """, unsafe_allow_html=True)
 
     st.markdown("### ⚙ Strategy")
-    swing_len = st.slider("Swing Period", 3, 12, 7,
-                          help="Lookback bars for swing high/low detection")
-    ema_span  = st.slider("EMA Trend Period", 50, 500, 200, step=10)
+    fast_span = st.slider("Fast EMA Period", 5, 100, 20,
+                          help="EMA period for fast momentum crossover")
+    slow_span = st.slider("Slow EMA Period", 10, 200, 50,
+                          help="EMA period for slow momentum crossover")
+    trend_span = st.slider("EMA Trend Period", 50, 500, 200, step=10,
+                          help="EMA period for macro trend filter baseline")
 
     st.markdown('<div class="cyber-divider"></div>', unsafe_allow_html=True)
     st.markdown("### 💰 Risk Management")
@@ -1689,11 +1748,12 @@ with st.sidebar:
     fee             = st.number_input("Fee per side (%)", 0.0, 0.5, 0.04, step=0.01, format="%.2f") / 100
     slippage        = st.number_input("Slippage (%)", 0.0, 0.5, 0.03, step=0.01, format="%.2f") / 100
     max_dd_pct      = st.slider("Max Drawdown Limit (%)", 5, 50, 25)
-    atr_filter      = st.toggle("ATR Volatility Filter", value=True)
+    atr_mult        = st.slider("ATR SL Multiplier", 1.0, 4.0, 1.5, step=0.1,
+                          help="Multiplier for ATR volatility-based Stop Loss")
 
     st.markdown('<div class="cyber-divider"></div>', unsafe_allow_html=True)
     st.markdown("### 🔬 Optimizer Grid")
-    swing_range  = st.slider("Swing Range", 3, 12, (3, 8))
+    fast_range   = st.slider("Fast EMA Range", 10, 50, (15, 30))
     risk_options = st.multiselect(
         "Risk% Values", [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0], default=[0.5, 1.0, 1.5]
     )
@@ -1780,7 +1840,7 @@ if date_start > date_end:
     st.stop()
 
 # ── Clear cached results when any key param changes ──
-_state_key = (str(date_start), str(date_end), swing_len, ema_span, risk_pct, rr, atr_filter)
+_state_key = (str(date_start), str(date_end), fast_span, slow_span, trend_span, risk_pct, rr, atr_mult)
 if st.session_state.get("_last_state_key") != _state_key:
     st.session_state.pop("last_result", None)
     st.session_state.pop("mc_curves",   None)
@@ -1795,7 +1855,7 @@ if len(df) < 100:
     st.error(f"⚠️ Only {len(df)} candles in selected range — please widen the window.")
     st.stop()
 
-df = add_indicators(df, ema_span=ema_span)
+df = add_indicators(df, fast_span=fast_span, slow_span=slow_span, trend_span=trend_span)
 
 # ─────────────────────────────────────────────────────
 #  HERO BANNER
@@ -1865,9 +1925,9 @@ with tab_live:
     df_live, fetch_err = fetch_live_candles("BTCUSDT", "4h", 300)
 
     if fetch_err:
-        st.error(f"\u26a0\ufe0f Could not fetch live data from Binance: {fetch_err}")
+        st.error(f"⚠️ Could not fetch live data from Binance: {fetch_err}")
     else:
-        sig = compute_live_signal(df_live, ema_span=ema_span, swing_len=swing_len, atr_filter=atr_filter)
+        sig = compute_live_signal(df_live, fast_span=fast_span, slow_span=slow_span, trend_span=trend_span, atr_mult=atr_mult, rr=rr)
         s_type = sig["signal"]
         s_color_map = {"LONG": "#00ff88", "SHORT": "#ff3366", "FLAT": "#00dcff", "NO DATA": "#ff8c00"}
         s_color = s_color_map.get(s_type, "#00dcff")
@@ -1938,7 +1998,8 @@ with tab_live:
             )
 
         section_header("\U0001f4c8", "Live Price Chart \u2014 Last 100 Candles")
-        df_plot = df_live.tail(100)
+        df_live_ind = add_indicators(df_live, fast_span=fast_span, slow_span=slow_span, trend_span=trend_span)
+        df_plot = df_live_ind.tail(100)
         fig_live = make_subplots(rows=2, cols=1, shared_xaxes=True,
                                  vertical_spacing=0.03, row_heights=[0.75, 0.25])
         fig_live.add_trace(go.Candlestick(
@@ -1948,10 +2009,17 @@ with tab_live:
             increasing_fillcolor="rgba(0,255,136,0.7)", decreasing_fillcolor="rgba(255,51,102,0.7)",
             name="OHLC", showlegend=False,
         ), row=1, col=1)
-        ema_live = df_live["Close"].ewm(span=ema_span, adjust=False).mean().tail(100)
         fig_live.add_trace(go.Scatter(
-            x=df_plot.index, y=ema_live.values,
-            line=dict(color="#ff8c00", width=1.5), name=f"EMA{ema_span}",
+            x=df_plot.index, y=df_plot["EMA_Fast"].values,
+            line=dict(color="#00ff88", width=1.2), name=f"EMA Fast ({fast_span})",
+        ), row=1, col=1)
+        fig_live.add_trace(go.Scatter(
+            x=df_plot.index, y=df_plot["EMA_Slow"].values,
+            line=dict(color="#ff3366", width=1.2), name=f"EMA Slow ({slow_span})",
+        ), row=1, col=1)
+        fig_live.add_trace(go.Scatter(
+            x=df_plot.index, y=df_plot["EMA_Trend"].values,
+            line=dict(color="#ff8c00", width=1.5), name=f"EMA Trend ({trend_span})",
         ), row=1, col=1)
         if s_type in ("LONG", "SHORT"):
             fig_live.add_trace(go.Scatter(
@@ -2224,7 +2292,7 @@ with tab_chart:
     section_header("◈", "Interactive OHLCV Chart")
 
     col_c1, col_c2, col_c3, col_c4 = st.columns(4)
-    show_ema    = col_c1.toggle(f"EMA {ema_span}",        value=True)
+    show_ema    = col_c1.toggle("EMA Indicators",        value=True)
     show_bb     = col_c2.toggle("Bollinger Bands",        value=False)
     show_swings = col_c3.toggle("Swing Points",           value=True)
     show_volume = col_c4.toggle("Volume Panel",           value=True)
@@ -2253,9 +2321,19 @@ with tab_chart:
 
     if show_ema:
         fig.add_trace(go.Scatter(
-            x=df_chart.index, y=df_chart["EMA200"],
+            x=df_chart.index, y=df_chart["EMA_Fast"],
+            line=dict(color="#00ff88", width=1.2),
+            name=f"EMA Fast ({fast_span})",
+        ), row=1, col=1)
+        fig.add_trace(go.Scatter(
+            x=df_chart.index, y=df_chart["EMA_Slow"],
+            line=dict(color="#ff3366", width=1.2),
+            name=f"EMA Slow ({slow_span})",
+        ), row=1, col=1)
+        fig.add_trace(go.Scatter(
+            x=df_chart.index, y=df_chart["EMA_Trend"],
             line=dict(color="#ff8c00", width=1.5, dash="solid"),
-            name=f"EMA{ema_span}",
+            name=f"EMA Trend ({trend_span})",
         ), row=1, col=1)
 
     if show_bb:
@@ -2271,7 +2349,7 @@ with tab_chart:
             ), row=1, col=1)
 
     if show_swings:
-        sh_s, sl_s = swings(df_chart, swing_len)
+        sh_s, sl_s = swings(df_chart, 7)
         fig.add_trace(go.Scatter(
             x=df_chart[sh_s].index, y=df_chart[sh_s]["High"] * 1.002,
             mode="markers",
@@ -2343,10 +2421,9 @@ with tab_backtest:
     section_header("◈", "Single Strategy Backtest")
     st.markdown(f"""
     <div class="info-box">
-      <b>Parameters:</b> Swing={swing_len} · Risk={risk_pct}% · RR={rr} ·
+      <b>Parameters:</b> Fast EMA={fast_span} · Slow EMA={slow_span} · Trend EMA={trend_span} · ATR Mult={atr_mult} · Risk={risk_pct}% · RR={rr} ·
       Capital=<b>${initial_capital:,}</b> · Leverage={max_leverage}× ·
-      Fee={fee*100:.2f}% · Slippage={slippage*100:.2f}% ·
-      ATR Filter={"ON" if atr_filter else "OFF"}
+      Fee={fee*100:.2f}% · Slippage={slippage*100:.2f}%
     </div>""", unsafe_allow_html=True)
 
     # Run immediately on page load OR on button click
@@ -2354,9 +2431,9 @@ with tab_backtest:
     if _run:
         with st.spinner("Computing backtest…"):
             result = backtest(
-                df, swing_len, risk_pct, rr, initial_capital,
+                df, fast_span, risk_pct, rr, initial_capital,
                 max_leverage, fee, slippage, max_dd_pct / 100,
-                atr_filter=atr_filter, detailed=True,
+                slow_span=slow_span, trend_span=trend_span, atr_mult=atr_mult, detailed=True,
             )
         if result is not None:
             st.session_state["last_result"] = result
@@ -2513,11 +2590,11 @@ with tab_optimizer:
     if not risk_options or not rr_options:
         st.warning("Select at least one Risk% and one RR value in the sidebar.")
     else:
-        n_combos = (swing_range[1] - swing_range[0] + 1) * len(risk_options) * len(rr_options)
+        n_combos = (fast_range[1] - fast_range[0] + 1) * len(risk_options) * len(rr_options)
         st.markdown(f"""
         <div class="info-box">
           Testing <b>{n_combos}</b> combinations —
-          Swing {swing_range[0]}–{swing_range[1]} ·
+          Fast EMA Range {fast_range[0]}–{fast_range[1]} ·
           Risk {risk_options} ·
           RR {rr_options}
         </div>""", unsafe_allow_html=True)
@@ -2528,13 +2605,13 @@ with tab_optimizer:
             opt_results = []
             done        = 0
 
-            for sw in range(swing_range[0], swing_range[1] + 1):
+            for sw in range(fast_range[0], fast_range[1] + 1):
                 for rk in risk_options:
                     for rv in rr_options:
                         res = backtest(
                             df, sw, rk, rv, initial_capital,
                             max_leverage, fee, slippage, max_dd_pct / 100,
-                            atr_filter=atr_filter, detailed=False,
+                            slow_span=int(sw * 2.5), trend_span=trend_span, atr_mult=atr_mult, detailed=False,
                         )
                         if res:
                             opt_results.append({
@@ -2551,7 +2628,7 @@ with tab_optimizer:
                         done += 1
                         progress.progress(done / n_combos)
                         status.markdown(
-                            f'<div class="info-box">Testing Swing={sw} · Risk={rk}% · RR={rv} — {done}/{n_combos}</div>',
+                            f'<div class="info-box">Testing Fast EMA={sw} · Risk={rk}% · RR={rv} — {done}/{n_combos}</div>',
                             unsafe_allow_html=True,
                         )
 
