@@ -40,11 +40,10 @@ ALERT_CONFIG = {
     "SMTP_USER":            _secret("SMTP_USER",   ""),
     "SMTP_PASS":            _secret("SMTP_PASS",   ""),
     "ALERT_EMAIL":          _secret("ALERT_EMAIL", "don911911911@gmail.com"),
-    "FAST_SPAN":            20,
-    "SLOW_SPAN":            50,
-    "TREND_SPAN":           200,
-    "ATR_MULT":             1.5,
-    "RR":                   3.0,
+    "MATH_WINDOW":          15,
+    "Z_THRESH":             1.2,
+    "STOP_MULT":            1.5,
+    "RR":                   2.5,
     "CHECK_EVERY_SECONDS":  1800,   # check every 30 min
 }
 
@@ -78,13 +77,14 @@ def _bg_fetch_candles():
     return df
 
 def _bg_compute_signal(df):
-    """Run EMA Crossover + MACD + RSI + ATR strategy (background thread version)."""
+    """Run Detrended Rolling Z-Score mathematical strategy (background thread version)."""
     cfg = ALERT_CONFIG
-    if df is None or len(df) < cfg["TREND_SPAN"] + 50:
+    window = cfg["MATH_WINDOW"]
+    if df is None or len(df) < window + 10:
         return {"signal": "NO DATA"}
         
     df = df.copy()
-    df = add_indicators(df, fast_span=cfg["FAST_SPAN"], slow_span=cfg["SLOW_SPAN"], trend_span=cfg["TREND_SPAN"])
+    df = add_math_metrics(df, window=window)
     
     last_idx = -2
     prev_idx = -3
@@ -93,51 +93,38 @@ def _bg_compute_signal(df):
     prev_row = df.iloc[prev_idx]
     current_row = df.iloc[-1]
     
-    long_cross = (prev_row["EMA_Fast"] <= prev_row["EMA_Slow"]) and (last_row["EMA_Fast"] > last_row["EMA_Slow"])
-    short_cross = (prev_row["EMA_Fast"] >= prev_row["EMA_Slow"]) and (last_row["EMA_Fast"] < last_row["EMA_Slow"])
+    # LONG: Z crosses above Z_THRESH
+    long_cross = (prev_row["Z"] <= cfg["Z_THRESH"]) and (last_row["Z"] > cfg["Z_THRESH"])
+    # SHORT: Z crosses below -Z_THRESH
+    short_cross = (prev_row["Z"] >= -cfg["Z_THRESH"]) and (last_row["Z"] < -cfg["Z_THRESH"])
     
     result = {
         "signal": "FLAT", "price": round(float(current_row["Close"]), 2),
-        "ema": round(float(last_row["EMA_Trend"]), 2), "atr": round(float(last_row["ATR"]), 2),
-        "atr_median": round(float(df["ATR"].median()), 2), "time": df.index[last_idx],
-        "reason": "Flat market / No crossover signals", "sl": None, "tp": None,
+        "mu": round(float(last_row["mu"]), 2), "sigma": round(float(last_row["sigma"]), 2),
+        "time": df.index[last_idx],
+        "reason": "Z-score within normal statistical boundaries", "sl": None, "tp": None,
     }
     
-    macd_bullish = last_row["MACD_Hist"] > 0
-    macd_bearish = last_row["MACD_Hist"] < 0
-    rsi_bullish = 50 <= last_row["RSI"] <= 65
-    rsi_bearish = 35 <= last_row["RSI"] <= 50
-    
     if long_cross:
-        if last_row["Close"] > last_row["EMA_Trend"]:
-            if macd_bullish and rsi_bullish:
-                atr_val = float(last_row["ATR"])
-                stop = float(current_row["Close"] - atr_val * cfg["ATR_MULT"])
-                risk = current_row["Close"] - stop
-                result.update({
-                    "signal": "LONG", "sl": round(stop, 2),
-                    "tp": round(float(current_row["Close"]) + risk * cfg["RR"], 2),
-                    "reason": "EMA 20/50 Bullish Cross + MACD/RSI Confirmed"
-                })
-            else:
-                result["reason"] = f"Bullish Cross rejected by MACD/RSI (RSI: {last_row['RSI']:.1f}, Hist: {last_row['MACD_Hist']:.4f})"
-        else:
-            result["reason"] = "Bullish Cross below EMA Trend Baseline"
+        vol = float(last_row["sigma"])
+        stop = float(current_row["Close"] - vol * cfg["STOP_MULT"])
+        risk = current_row["Close"] - stop
+        if risk > 0:
+            result.update({
+                "signal": "LONG", "sl": round(stop, 2),
+                "tp": round(float(current_row["Close"]) + risk * cfg["RR"], 2),
+                "reason": f"Z-Score positive momentum breakout ({last_row['Z']:.2f})"
+            })
     elif short_cross:
-        if last_row["Close"] < last_row["EMA_Trend"]:
-            if macd_bearish and rsi_bearish:
-                atr_val = float(last_row["ATR"])
-                stop = float(current_row["Close"] + atr_val * cfg["ATR_MULT"])
-                risk = stop - current_row["Close"]
-                result.update({
-                    "signal": "SHORT", "sl": round(stop, 2),
-                    "tp": round(float(current_row["Close"]) - risk * cfg["RR"], 2),
-                    "reason": "EMA 20/50 Bearish Cross + MACD/RSI Confirmed"
-                })
-            else:
-                result["reason"] = f"Bearish Cross rejected by MACD/RSI (RSI: {last_row['RSI']:.1f}, Hist: {last_row['MACD_Hist']:.4f})"
-        else:
-            result["reason"] = "Bearish Cross above EMA Trend Baseline"
+        vol = float(last_row["sigma"])
+        stop = float(current_row["Close"] + vol * cfg["STOP_MULT"])
+        risk = stop - current_row["Close"]
+        if risk > 0:
+            result.update({
+                "signal": "SHORT", "sl": round(stop, 2),
+                "tp": round(float(current_row["Close"]) - risk * cfg["RR"], 2),
+                "reason": f"Z-Score negative momentum breakout ({last_row['Z']:.2f})"
+            })
             
     return result
 
@@ -287,12 +274,12 @@ def _bg_send_no_trade_status_email(sig):
             <td style="padding:10px 0;color:#e8f4ff;font-weight:700;text-align:right;">${sig.get('price', 0.0):,.2f}</td>
           </tr>
           <tr style="border-bottom:1px solid rgba(255,255,255,0.06);">
-            <td style="padding:10px 0;color:#7aa0c0;">EMA Baseline</td>
-            <td style="padding:10px 0;color:#e8f4ff;text-align:right;">${sig.get('ema', 0.0):,.2f}</td>
+            <td style="padding:10px 0;color:#7aa0c0;">Rolling Price Mean</td>
+            <td style="padding:10px 0;color:#e8f4ff;text-align:right;">${sig.get('mu', 0.0):,.2f}</td>
           </tr>
           <tr style="border-bottom:1px solid rgba(255,255,255,0.06);">
-            <td style="padding:10px 0;color:#7aa0c0;">ATR (14)</td>
-            <td style="padding:10px 0;color:#e8f4ff;text-align:right;">${sig.get('atr', 0.0):,.2f} <span style="font-size:11px;color:#7aa0c0;">(median ${sig.get('atr_median', 0.0):,.2f})</span></td>
+            <td style="padding:10px 0;color:#7aa0c0;">Standard Deviation</td>
+            <td style="padding:10px 0;color:#e8f4ff;text-align:right;">${sig.get('sigma', 0.0):,.2f}</td>
           </tr>
           <tr>
             <td style="padding:10px 0;color:#7aa0c0;">Market State</td>
@@ -1109,37 +1096,39 @@ def load_csv():
 # ─────────────────────────────────────────────────────
 #  INDICATORS
 # ─────────────────────────────────────────────────────
-def add_indicators(df, fast_span=20, slow_span=50, trend_span=200, atr_period=14):
+def add_math_metrics(df, window=15):
     df = df.copy()
-    df["EMA_Fast"]  = df["Close"].ewm(span=fast_span, adjust=False).mean()
-    df["EMA_Slow"]  = df["Close"].ewm(span=slow_span, adjust=False).mean()
-    df["EMA_Trend"] = df["Close"].ewm(span=trend_span, adjust=False).mean()
+    df["mu"] = df["Close"].rolling(window).mean()
+    df["sigma"] = df["Close"].rolling(window).std()
+    df["Z"] = (df["Close"] - df["mu"]) / df["sigma"]
+    return df
+
+def add_indicators(df, fast_span=15, slow_span=1.2, trend_span=None, atr_period=14):
+    df = add_math_metrics(df, window=fast_span)
+    z_val = 1.2 if slow_span is None else float(slow_span)
     
-    # ATR Calculation
-    tr = pd.concat([
-        df["High"] - df["Low"],
-        (df["High"] - df["Close"].shift()).abs(),
-        (df["Low"] - df["Close"].shift()).abs(),
-    ], axis=1).max(axis=1)
-    df["ATR"] = tr.rolling(atr_period).mean()
+    # Mathematical Z-Score Map for backwards compatibility
+    df["EMA_Fast"]  = df["mu"]
+    df["EMA_Slow"]  = df["mu"] + z_val * df["sigma"]   # Upper Breakout Channel
+    df["EMA_Trend"] = df["mu"] - z_val * df["sigma"]   # Lower Breakout Channel
     
-    # RSI Calculation
-    delta = df["Close"].diff()
-    gain  = delta.clip(lower=0).rolling(14).mean()
-    loss  = (-delta.clip(upper=0)).rolling(14).mean()
-    rs    = gain / loss.replace(0, np.nan)
-    df["RSI"]      = 100 - (100 / (1 + rs))
+    # Volatility dispersion bounds
+    df["BB_mid"]   = df["mu"]
+    df["BB_upper"] = df["BB_mid"] + 2.0 * df["sigma"]
+    df["BB_lower"] = df["BB_mid"] - 2.0 * df["sigma"]
     
-    # MACD Calculation
-    ema12 = df["Close"].ewm(span=12, adjust=False).mean()
-    ema26 = df["Close"].ewm(span=26, adjust=False).mean()
-    df["MACD"] = ema12 - ema26
-    df["MACD_Signal"] = df["MACD"].ewm(span=9, adjust=False).mean()
-    df["MACD_Hist"] = df["MACD"] - df["MACD_Signal"]
+    # Statistical Z-Score mapped perfectly onto a [0, 100] scale
+    # Z-score of 0.0 -> 50.0, Z-score of +Z -> 50 + 15 = 65, Z-score of -Z -> 50 - 15 = 35
+    # Formula maps z_val exactly to 65: Z_scaled = 50 + (Z / z_val) * 15
+    df["RSI"] = 50.0 + (df["Z"] / z_val) * 15.0
+    df["RSI"] = df["RSI"].clip(0.0, 100.0)
     
-    df["BB_mid"]   = df["Close"].rolling(20).mean()
-    df["BB_upper"] = df["BB_mid"] + 2 * df["Close"].rolling(20).std()
-    df["BB_lower"] = df["BB_mid"] - 2 * df["Close"].rolling(20).std()
+    # Volatility standard deviation proxy
+    df["ATR"] = df["sigma"]
+    
+    # Dummy MACD for compliance
+    df["MACD_Hist"] = df["Z"]  # Used to check sign (>0 / <0) which exactly matches Z's sign!
+    
     return df
 
 # ─────────────────────────────────────────────────────
@@ -1156,10 +1145,13 @@ def swings(data, n):
 def backtest(df, fast_span, risk_pct, rr, initial_capital,
              max_leverage, fee, slippage, max_dd_allowed,
              slow_span=None, trend_span=200, atr_mult=1.5, detailed=False):
-    # Dynamic defaults for optimization compatibility
-    if slow_span is None:
-        slow_span = int(fast_span * 2.5)
-        
+    # fast_span is treated as the Math Window (default 15)
+    # atr_mult is treated as the Volatility Stop Multiplier (default 1.5)
+    # slow_span is treated as Z_THRESH (default 1.2)
+    
+    z_thresh = 1.2 if slow_span is None else float(slow_span)
+    window = int(fast_span)
+    
     capital = float(initial_capital)
     peak = capital
     max_dd = 0
@@ -1171,10 +1163,10 @@ def backtest(df, fast_span, risk_pct, rr, initial_capital,
     trade_records = []
     entry_time = entry_price = risk_amt_saved = None
 
-    # Compute indicators for this backtest run
-    df = add_indicators(df, fast_span=fast_span, slow_span=slow_span, trend_span=trend_span)
+    # Compute mathematical metrics
+    df = add_indicators(df, fast_span=window)
 
-    for i in range(trend_span + 30, len(df)):
+    for i in range(window + 10, len(df)):
         row = df.iloc[i]
         prev_row = df.iloc[i-1]
         
@@ -1221,19 +1213,16 @@ def backtest(df, fast_span, risk_pct, rr, initial_capital,
         else:
             risk_amount = capital * (risk_pct / 100)
             
-            # Crossover triggers
-            long_cross = (prev_row["EMA_Fast"] <= prev_row["EMA_Slow"]) and (row["EMA_Fast"] > row["EMA_Slow"])
-            short_cross = (prev_row["EMA_Fast"] >= prev_row["EMA_Slow"]) and (row["EMA_Fast"] < row["EMA_Slow"])
+            # Mathematical Z-Score triggers
+            # LONG when Z crosses above z_thresh
+            long_cross = (prev_row["Z"] <= z_thresh) and (row["Z"] > z_thresh)
+            # SHORT when Z crosses below -z_thresh
+            short_cross = (prev_row["Z"] >= -z_thresh) and (row["Z"] < -z_thresh)
             
-            macd_bullish = row["MACD_Hist"] > 0
-            macd_bearish = row["MACD_Hist"] < 0
-            rsi_bullish = 50 <= row["RSI"] <= 65
-            rsi_bearish = 35 <= row["RSI"] <= 50
-            
-            if long_cross and row["Close"] > row["EMA_Trend"] and macd_bullish and rsi_bullish:
-                entry_p = row["Close"] * (1 + slippage)
-                atr_val = row["ATR"]
-                stop = entry_p - atr_val * atr_mult
+            if long_cross:
+                entry_p = row["Open"] * (1 + slippage) # Enter at the open of current candle
+                vol = prev_row["sigma"]
+                stop = entry_p - vol * atr_mult
                 risk = entry_p - stop
                 if risk <= 0:
                     if detailed: equity_curve.append((df.index[i], capital))
@@ -1246,13 +1235,13 @@ def backtest(df, fast_span, risk_pct, rr, initial_capital,
                 entry    = entry_p
                 if detailed:
                     entry_time     = df.index[i]
-                    entry_price    = row["Close"]
+                    entry_price    = entry_p
                     risk_amt_saved = risk_amount
                     
-            elif short_cross and row["Close"] < row["EMA_Trend"] and macd_bearish and rsi_bearish:
-                entry_p = row["Close"] * (1 - slippage)
-                atr_val = row["ATR"]
-                stop = entry_p + atr_val * atr_mult
+            elif short_cross:
+                entry_p = row["Open"] * (1 - slippage)
+                vol = prev_row["sigma"]
+                stop = entry_p + vol * atr_mult
                 risk = stop - entry_p
                 if risk <= 0:
                     if detailed: equity_curve.append((df.index[i], capital))
@@ -1265,7 +1254,7 @@ def backtest(df, fast_span, risk_pct, rr, initial_capital,
                 entry    = entry_p
                 if detailed:
                     entry_time     = df.index[i]
-                    entry_price    = row["Close"]
+                    entry_price    = entry_p
                     risk_amt_saved = risk_amount
                     
         if detailed:
@@ -1300,7 +1289,7 @@ def backtest(df, fast_span, risk_pct, rr, initial_capital,
             "status":       "OPEN",
         })
         
-    if trades < 3: # Lower threshold since crossovers are more selective
+    if trades < 3:
         return None
         
     return_pct = (capital / initial_capital - 1) * 100
@@ -1341,7 +1330,7 @@ def monte_carlo(R_list, initial_capital, risk_pct, runs=1000):
 #  DATA CONSTANTS
 # ─────────────────────────────────────────────────────
 from datetime import date as _date
-DATA_START = _date(2018, 1, 1)
+DATA_START = _date(2024, 1, 1)
 DATA_END   = datetime.now(timezone.utc).date()   # always today
 
 # ─────────────────────────────────────────────────────
@@ -1505,41 +1494,27 @@ def fetch_exchange_range(start_dt, end_dt):
     return _fetch_candles_range(start_dt, end_dt)
 
 # ─────────────────────────────────────────────────────
-#  LOAD & MERGE  CSV (2018-2025) + Binance (2026-today)
+#  DYNAMIC HISTORICAL DATA LOADER (Bybit / OKX API)
 # ─────────────────────────────────────────────────────
 @st.cache_data(ttl=300)
 def load_full_data():
-    # ── Part 1: historical CSV ─────────────────────────
-    df_hist = pd.read_csv(CSV_FILE)
-    for c in ["Open","High","Low","Close","Volume"]:
-        if c in df_hist.columns:
-            df_hist[c] = pd.to_numeric(df_hist[c], errors="coerce")
-    df_hist = df_hist[["Open","High","Low","Close","Volume"]].dropna()
-    # CSV timestamps are broken — rebuild a clean 4H index from 2018-01-01
-    df_hist.index = pd.date_range(start="2018-01-01", periods=len(df_hist), freq="4h")
-    df_hist.index.name = "Open time"
-
-    # ── Part 2: Bybit/OKX 2026-01-01 → today ─────────
-    live_start = _date(2026, 1, 1)
-    live_end   = DATA_END
-    df_new = None
+    df_combined = fetch_exchange_range(DATA_START, DATA_END)
     fetch_error = None
-    if live_end >= live_start:
-        df_new = fetch_exchange_range(live_start, live_end)
-        if df_new is None:
-            fetch_error = "Could not fetch 2026+ live data (Bybit & OKX both failed) — using CSV only."
-
-    # ── Part 3: merge ─────────────────────────────────
-    if df_new is not None and len(df_new) > 0:
-        # Remove any CSV rows that overlap with Binance data
-        cutoff = df_new.index[0]
-        df_hist = df_hist[df_hist.index < cutoff]
-        df_combined = pd.concat([df_hist, df_new])
-        df_combined = df_combined[~df_combined.index.duplicated(keep="last")]
-        df_combined.sort_index(inplace=True)
-    else:
-        df_combined = df_hist
-
+    if df_combined is None or len(df_combined) == 0:
+        fetch_error = "Could not fetch dynamic history from Bybit/OKX APIs. Attempting local backup load."
+        # ultimate fallback to keep the app working if internet is down
+        try:
+            df_combined = pd.read_csv(CSV_FILE)
+            for c in ["Open","High","Low","Close","Volume"]:
+                if c in df_combined.columns:
+                    df_combined[c] = pd.to_numeric(df_combined[c], errors="coerce")
+            df_combined = df_combined[["Open","High","Low","Close","Volume"]].dropna()
+            df_combined.index = pd.date_range(start="2018-01-01", periods=len(df_combined), freq="4h")
+            df_combined.index.name = "Open time"
+            df_combined = df_combined[df_combined.index >= pd.Timestamp(DATA_START)]
+        except Exception as e:
+            df_combined = pd.DataFrame()
+            fetch_error += f" Backup CSV load failed: {e}"
     return df_combined, fetch_error
 
 # ─────────────────────────────────────────────────────
@@ -1715,9 +1690,7 @@ if _fetch_warn:
     st.warning(f"⚠️ {_fetch_warn}")
 
 # Show data source summary
-_binance_rows = int((df_raw.index >= pd.Timestamp("2026-01-01")).sum()
-                     if len(df_raw) else 0)
-_csv_rows = len(df_raw) - _binance_rows
+_api_rows = len(df_raw)
 
 # ─────────────────────────────────────────────────────
 #  SIDEBAR
@@ -1732,12 +1705,11 @@ with st.sidebar:
     """, unsafe_allow_html=True)
 
     st.markdown("### ⚙ Strategy")
-    fast_span = st.slider("Fast EMA Period", 5, 100, 20,
-                          help="EMA period for fast momentum crossover")
-    slow_span = st.slider("Slow EMA Period", 10, 200, 50,
-                          help="EMA period for slow momentum crossover")
-    trend_span = st.slider("EMA Trend Period", 50, 500, 200, step=10,
-                          help="EMA period for macro trend filter baseline")
+    fast_span = st.slider("Rolling Math Window", 5, 50, 15,
+                          help="Rolling window size for statistical mean and standard deviation")
+    slow_span = st.slider("Z-Score Threshold", 0.5, 3.0, 1.2, step=0.1,
+                          help="Statistical Z-Score threshold for momentum breakouts")
+    trend_span = 200
 
     st.markdown('<div class="cyber-divider"></div>', unsafe_allow_html=True)
     st.markdown("### 💰 Risk Management")
@@ -1748,12 +1720,13 @@ with st.sidebar:
     fee             = st.number_input("Fee per side (%)", 0.0, 0.5, 0.04, step=0.01, format="%.2f") / 100
     slippage        = st.number_input("Slippage (%)", 0.0, 0.5, 0.03, step=0.01, format="%.2f") / 100
     max_dd_pct      = st.slider("Max Drawdown Limit (%)", 5, 50, 25)
-    atr_mult        = st.slider("ATR SL Multiplier", 1.0, 4.0, 1.5, step=0.1,
-                          help="Multiplier for ATR volatility-based Stop Loss")
+    atr_mult        = st.slider("Volatility Stop Multiplier", 1.0, 4.0, 1.5, step=0.1,
+                          help="Multiplier for price standard deviation volatility stop loss")
 
     st.markdown('<div class="cyber-divider"></div>', unsafe_allow_html=True)
     st.markdown("### 🔬 Optimizer Grid")
-    fast_range   = st.slider("Fast EMA Range", 10, 50, (15, 30))
+    fast_range   = st.slider("Math Window Range", 10, 30, (15, 25),
+                          help="Range of rolling windows to sweep in parameter optimization")
     risk_options = st.multiselect(
         "Risk% Values", [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0], default=[0.5, 1.0, 1.5]
     )
@@ -1791,7 +1764,7 @@ with st.sidebar:
       <div style="font-family:var(--font-mono);font-size:10px;color:var(--text-mid);">
         {DATA_START.strftime('%b %d, %Y')} → {DATA_END.strftime('%b %d, %Y')}<br>
         {len(df_raw):,} total candles · 4H<br>
-        CSV 2018–2025 + Binance 2026–today
+        Bybit/OKX APIs (No CSV)
       </div>
     </div>
     """, unsafe_allow_html=True)
@@ -2292,10 +2265,10 @@ with tab_chart:
     section_header("◈", "Interactive OHLCV Chart")
 
     col_c1, col_c2, col_c3, col_c4 = st.columns(4)
-    show_ema    = col_c1.toggle("EMA Indicators",        value=True)
-    show_bb     = col_c2.toggle("Bollinger Bands",        value=False)
-    show_swings = col_c3.toggle("Swing Points",           value=True)
-    show_volume = col_c4.toggle("Volume Panel",           value=True)
+    show_ema    = col_c1.toggle("Math Dispersion Channel", value=True)
+    show_bb     = col_c2.toggle("Statistical Bounds (2σ)", value=False)
+    show_swings = col_c3.toggle("Visual Swing Points",     value=True)
+    show_volume = col_c4.toggle("Volume Panel",            value=True)
 
     chart_rows  = 3 if show_volume else 2
     row_heights = [0.55, 0.25, 0.20] if show_volume else [0.7, 0.3]
@@ -2323,24 +2296,24 @@ with tab_chart:
         fig.add_trace(go.Scatter(
             x=df_chart.index, y=df_chart["EMA_Fast"],
             line=dict(color="#00ff88", width=1.2),
-            name=f"EMA Fast ({fast_span})",
+            name=f"Rolling Price Mean ({fast_span})",
         ), row=1, col=1)
         fig.add_trace(go.Scatter(
             x=df_chart.index, y=df_chart["EMA_Slow"],
-            line=dict(color="#ff3366", width=1.2),
-            name=f"EMA Slow ({slow_span})",
+            line=dict(color="#ff3366", width=1.0, dash="dash"),
+            name=f"Upper Breakout Band (+{slow_span}σ)",
         ), row=1, col=1)
         fig.add_trace(go.Scatter(
             x=df_chart.index, y=df_chart["EMA_Trend"],
-            line=dict(color="#ff8c00", width=1.5, dash="solid"),
-            name=f"EMA Trend ({trend_span})",
+            line=dict(color="#ff3366", width=1.0, dash="dash"),
+            name=f"Lower Breakout Band (-{slow_span}σ)",
         ), row=1, col=1)
 
     if show_bb:
         for band, color, dash, name in [
-            ("BB_upper", "rgba(178,75,255,0.7)", "dot",  "BB Upper"),
-            ("BB_lower", "rgba(178,75,255,0.7)", "dot",  "BB Lower"),
-            ("BB_mid",   "rgba(178,75,255,0.4)", "dash", "BB Mid"),
+            ("BB_upper", "rgba(178,75,255,0.7)", "dot",  "Upper Bound (+2σ)"),
+            ("BB_lower", "rgba(178,75,255,0.7)", "dot",  "Lower Bound (-2σ)"),
+            ("BB_mid",   "rgba(178,75,255,0.4)", "dash", "Rolling Mean"),
         ]:
             fig.add_trace(go.Scatter(
                 x=df_chart.index, y=df_chart[band],
@@ -2365,16 +2338,17 @@ with tab_chart:
             name="Swing Low",
         ), row=1, col=1)
 
-    # RSI
+    # Z-Score Panel (represented as normalized Z on [0, 100] scale, where Z-score of 0 is 50)
     fig.add_trace(go.Scatter(
         x=df_chart.index, y=df_chart["RSI"],
-        line=dict(color="#b24bff", width=1.5), name="RSI",
+        line=dict(color="#b24bff", width=1.5), name="Z-Score (scaled)",
     ), row=2, col=1)
-    fig.add_hrect(y0=70, y1=100, fillcolor="rgba(255,51,102,0.06)",  line_width=0, row=2, col=1)
-    fig.add_hrect(y0=0,  y1=30,  fillcolor="rgba(0,255,136,0.06)",   line_width=0, row=2, col=1)
-    fig.add_hline(y=70, line_dash="dot", line_color="rgba(255,51,102,0.4)",  line_width=1, row=2, col=1)
-    fig.add_hline(y=30, line_dash="dot", line_color="rgba(0,255,136,0.4)",   line_width=1, row=2, col=1)
-    fig.add_hline(y=50, line_dash="dot", line_color="rgba(255,255,255,0.06)", line_width=1, row=2, col=1)
+    # Highlight statistical outlier zones (Z > 1.2 or Z < -1.2, i.e. RSI > 65 or RSI < 35)
+    fig.add_hrect(y0=65, y1=100, fillcolor="rgba(0,255,136,0.06)",  line_width=0, row=2, col=1)
+    fig.add_hrect(y0=0,  y1=35,  fillcolor="rgba(255,51,102,0.06)",   line_width=0, row=2, col=1)
+    fig.add_hline(y=65, line_dash="dot", line_color="rgba(0,255,136,0.4)",  line_width=1, row=2, col=1, annotation_text="+Z Threshold")
+    fig.add_hline(y=35, line_dash="dot", line_color="rgba(255,51,102,0.4)",   line_width=1, row=2, col=1, annotation_text="-Z Threshold")
+    fig.add_hline(y=50, line_dash="solid", line_color="rgba(255,255,255,0.12)", line_width=1, row=2, col=1, annotation_text="Mean (Z=0)")
 
     if show_volume:
         colors_vol = [
@@ -2388,30 +2362,30 @@ with tab_chart:
 
     fig.update_layout(
         **PLOTLY_LAYOUT, height=720,
-        title=f"BTC/USDT — 4H  ·  {date_start} → {date_end}",
+        title=f"BTC/USDT — 4H Statistical Detrended Analysis · {date_start} → {date_end}",
         xaxis_rangeslider_visible=False,
     )
     fig.update_yaxes(title_text="Price (USD)", row=1, col=1)
-    fig.update_yaxes(title_text="RSI",         row=2, col=1, range=[0, 100])
+    fig.update_yaxes(title_text="Z-Score (0-100 scale)", row=2, col=1, range=[0, 100])
     if show_volume:
         fig.update_yaxes(title_text="Volume",  row=3, col=1)
     st.plotly_chart(fig, use_container_width=True)
 
     cyber_divider()
-    section_header("◈", "ATR — Volatility Regime")
+    section_header("◈", "Standard Deviation — Volatility Regime")
     fig_atr = go.Figure()
     fig_atr.add_trace(go.Scatter(
         x=df_chart.index, y=df_chart["ATR"],
         fill="tozeroy", fillcolor="rgba(178,75,255,0.06)",
-        line=dict(color="#b24bff", width=1.5), name="ATR(14)",
+        line=dict(color="#b24bff", width=1.5), name="Std Dev (σ)",
     ))
     fig_atr.add_hline(
         y=df["ATR"].median(), line_dash="dash",
         line_color="rgba(0,220,255,0.5)", line_width=1.2,
-        annotation_text="Median ATR",
+        annotation_text="Median Volatility",
         annotation_font=dict(color="#00dcff", family="JetBrains Mono", size=10),
     )
-    fig_atr.update_layout(**PLOTLY_LAYOUT, height=200, yaxis_title="ATR ($)")
+    fig_atr.update_layout(**PLOTLY_LAYOUT, height=200, yaxis_title="Price Std Dev (σ) ($)")
     st.plotly_chart(fig_atr, use_container_width=True)
 
 # ══════════════════════════════════════════════════════
@@ -2421,7 +2395,7 @@ with tab_backtest:
     section_header("◈", "Single Strategy Backtest")
     st.markdown(f"""
     <div class="info-box">
-      <b>Parameters:</b> Fast EMA={fast_span} · Slow EMA={slow_span} · Trend EMA={trend_span} · ATR Mult={atr_mult} · Risk={risk_pct}% · RR={rr} ·
+      <b>Parameters:</b> Math Window={fast_span} · Z Threshold={slow_span} · Volatility Stop={atr_mult} · Risk={risk_pct}% · RR={rr} ·
       Capital=<b>${initial_capital:,}</b> · Leverage={max_leverage}× ·
       Fee={fee*100:.2f}% · Slippage={slippage*100:.2f}%
     </div>""", unsafe_allow_html=True)
@@ -2594,7 +2568,7 @@ with tab_optimizer:
         st.markdown(f"""
         <div class="info-box">
           Testing <b>{n_combos}</b> combinations —
-          Fast EMA Range {fast_range[0]}–{fast_range[1]} ·
+          Math Window Range {fast_range[0]}–{fast_range[1]} ·
           Risk {risk_options} ·
           RR {rr_options}
         </div>""", unsafe_allow_html=True)
@@ -2611,7 +2585,7 @@ with tab_optimizer:
                         res = backtest(
                             df, sw, rk, rv, initial_capital,
                             max_leverage, fee, slippage, max_dd_pct / 100,
-                            slow_span=int(sw * 2.5), trend_span=trend_span, atr_mult=atr_mult, detailed=False,
+                            slow_span=slow_span, trend_span=trend_span, atr_mult=atr_mult, detailed=False,
                         )
                         if res:
                             opt_results.append({
@@ -2628,7 +2602,7 @@ with tab_optimizer:
                         done += 1
                         progress.progress(done / n_combos)
                         status.markdown(
-                            f'<div class="info-box">Testing Fast EMA={sw} · Risk={rk}% · RR={rv} — {done}/{n_combos}</div>',
+                            f'<div class="info-box">Testing Math Window={sw} · Risk={rk}% · RR={rv} — {done}/{n_combos}</div>',
                             unsafe_allow_html=True,
                         )
 
