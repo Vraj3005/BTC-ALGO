@@ -35,11 +35,11 @@ def _secret(key, fallback):
         return st.secrets[key]
     except Exception:
         return os.getenv(key, fallback)
-
+    
 ALERT_CONFIG = {
     "SMTP_USER":            _secret("SMTP_USER",   ""),
     "SMTP_PASS":            _secret("SMTP_PASS",   ""),
-    "ALERT_EMAIL":          _secret("ALERT_EMAIL", ""),
+    "ALERT_EMAIL":          _secret("ALERT_EMAIL", "don911911911@gmail.com"),
     "EMA_SPAN":             200,
     "SWING_LEN":            7,
     "ATR_FILTER":           True,
@@ -59,14 +59,16 @@ _log = logging.getLogger("btc_bg_alerter")
 def _get_alerter_state():
     """Shared mutable dict kept alive for the lifetime of the server process."""
     return {
-        "running":          False,
-        "last_signal_time": None,
-        "last_check":       None,
-        "last_signal":      "—",
-        "last_price":       0.0,
-        "emails_sent":      0,
-        "errors":           0,
-        "log":              [],          # last 20 entries
+        "running":            False,
+        "last_signal_time":   None,
+        "last_check":         None,
+        "last_signal":        "—",
+        "last_price":         0.0,
+        "emails_sent":        0,
+        "errors":             0,
+        "log":                [],          # last 20 entries
+        "active_trade":       None,        # Track open trade: {"type": "LONG"/"SHORT", "entry_price": float, "sl": float, "tp": float, "time": str}
+        "last_processed_bar": None,        # open time of the last processed candle
     }
 
 def _bg_fetch_candles():
@@ -92,7 +94,7 @@ def _bg_compute_signal(df):
     sl_ = df["Low"]  == df["Low"].rolling(n * 2 + 1, center=True).min()
     atr_med = df["ATR"].median()
     last    = df.iloc[-1]
-    prev_w  = df.iloc[-(n + 2):-1]
+    
     result  = {
         "signal": "FLAT", "price": round(float(last["Close"]), 2),
         "ema": round(float(last["EMA"]), 2), "atr": round(float(last["ATR"]), 2),
@@ -102,70 +104,29 @@ def _bg_compute_signal(df):
     if cfg["ATR_FILTER"] and last["ATR"] < atr_med:
         result["reason"] = "ATR below median — low volatility"
         return result
-    if sl_.iloc[-2] and last["Close"] > last["EMA"]:
-        stop = float(prev_w["Low"].min())
+        
+    confirmed_idx = -(n + 1)
+    if sl_.iloc[confirmed_idx] and last["Close"] > last["EMA"]:
+        stop_w = df.iloc[confirmed_idx - n : confirmed_idx]
+        stop = float(stop_w["Low"].min())
         risk = last["Close"] - stop
         if risk > 0:
             result.update({"signal": "LONG", "sl": round(stop, 2),
                            "tp": round(float(last["Close"]) + risk * cfg["RR"], 2),
-                           "reason": "Swing Low + Price above EMA200"})
-    elif sh.iloc[-2] and last["Close"] < last["EMA"]:
-        stop = float(prev_w["High"].max())
+                           "reason": "Swing Low confirmed + Price above EMA200"})
+    elif sh.iloc[confirmed_idx] and last["Close"] < last["EMA"]:
+        stop_w = df.iloc[confirmed_idx - n : confirmed_idx]
+        stop = float(stop_w["High"].max())
         risk = stop - last["Close"]
         if risk > 0:
             result.update({"signal": "SHORT", "sl": round(stop, 2),
                            "tp": round(float(last["Close"]) - risk * cfg["RR"], 2),
-                           "reason": "Swing High + Price below EMA200"})
+                           "reason": "Swing High confirmed + Price below EMA200"})
     return result
 
-def _bg_send_email(sig):
-    """Send alert email from the background thread."""
-    cfg       = ALERT_CONFIG
-    direction = sig["signal"]
-    color     = "#00ff88" if direction == "LONG" else "#ff3366"
-    arrow     = "▲ LONG"  if direction == "LONG" else "▼ SHORT"
-    sl_pct    = abs(sig["price"] - sig["sl"])   / sig["price"] * 100
-    tp_pct    = abs(sig["tp"]    - sig["price"]) / sig["price"] * 100
-    ts        = sig["time"].strftime("%Y-%m-%d %H:%M UTC")
-    subject   = f"[BTC Algo] {direction} Signal — ${sig['price']:,.0f}  |  {ts}"
-    html = f"""
-    <html><body style="background:#020408;color:#e8f4ff;
-                       font-family:Arial,sans-serif;padding:24px;">
-      <div style="max-width:540px;margin:auto;background:#071020;
-                  border:1px solid {color}55;border-radius:12px;padding:28px;">
-        <div style="font-size:30px;font-weight:700;color:{color};margin-bottom:4px;">{arrow}</div>
-        <div style="font-size:12px;color:#7aa0c0;margin-bottom:24px;">BTC/USDT · 4H · {ts}</div>
-        <table style="width:100%;border-collapse:collapse;font-size:15px;">
-          <tr style="border-bottom:1px solid rgba(255,255,255,0.06);">
-            <td style="padding:10px 0;color:#7aa0c0;">Entry Price</td>
-            <td style="padding:10px 0;color:{color};font-weight:700;font-size:22px;text-align:right;">${sig['price']:,.2f}</td>
-          </tr>
-          <tr style="border-bottom:1px solid rgba(255,255,255,0.06);">
-            <td style="padding:10px 0;color:#7aa0c0;">Stop Loss</td>
-            <td style="padding:10px 0;color:#ff3366;font-weight:600;text-align:right;">${sig['sl']:,.2f} <span style="font-size:11px;color:#7aa0c0;">({sl_pct:.2f}% risk)</span></td>
-          </tr>
-          <tr style="border-bottom:1px solid rgba(255,255,255,0.06);">
-            <td style="padding:10px 0;color:#7aa0c0;">Take Profit ({cfg['RR']}R)</td>
-            <td style="padding:10px 0;color:#00ff88;font-weight:600;text-align:right;">${sig['tp']:,.2f} <span style="font-size:11px;color:#7aa0c0;">(+{tp_pct:.2f}%)</span></td>
-          </tr>
-          <tr style="border-bottom:1px solid rgba(255,255,255,0.06);">
-            <td style="padding:10px 0;color:#7aa0c0;">EMA {cfg['EMA_SPAN']}</td>
-            <td style="padding:10px 0;color:#e8f4ff;text-align:right;">${sig['ema']:,.2f}</td>
-          </tr>
-          <tr><td style="padding:10px 0;color:#7aa0c0;">ATR(14)</td>
-            <td style="padding:10px 0;color:#e8f4ff;text-align:right;">${sig['atr']:,.2f} <span style="font-size:11px;color:#7aa0c0;">(median ${sig['atr_median']:,.2f})</span></td>
-          </tr>
-          <tr><td style="padding:10px 0;color:#7aa0c0;">Reason</td>
-            <td style="padding:10px 0;color:#e8f4ff;text-align:right;">{sig['reason']}</td>
-          </tr>
-        </table>
-        <div style="margin-top:22px;padding:12px 16px;background:rgba(255,140,0,0.07);
-                    border-left:3px solid #ff8c00;border-radius:4px;
-                    font-size:11px;color:#7aa0c0;line-height:1.7;">
-          ⚠️ Automated algorithmic signal. Always apply your own risk management.
-        </div>
-      </div>
-    </body></html>"""
+def _send_raw_email(subject, html):
+    """Low-level helper to send a Gmail SMTP secure email."""
+    cfg = ALERT_CONFIG
     try:
         msg = MIMEMultipart("alternative")
         msg["Subject"] = subject
@@ -176,23 +137,205 @@ def _bg_send_email(sig):
         with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ctx) as server:
             server.login(cfg["SMTP_USER"], cfg["SMTP_PASS"])
             server.sendmail(cfg["SMTP_USER"], cfg["ALERT_EMAIL"], msg.as_string())
-        _log.info(f"BG email sent: {direction} @ ${sig['price']:,.2f}")
+        _log.info(f"BG email sent: {subject}")
         return True
     except Exception as e:
-        _log.error(f"BG email failed: {e}")
+        _log.error(f"BG email send failed: {e}")
         return False
+
+def _bg_send_new_trade_email(active_trade):
+    """Send alert email when a new trade is opened."""
+    cfg = ALERT_CONFIG
+    if not cfg["SMTP_USER"] or not cfg["SMTP_PASS"] or not cfg["ALERT_EMAIL"]:
+        _log.error("BG new trade email failed: credentials not set")
+        return False
+    direction = active_trade["type"]
+    color     = "#00ff88" if direction == "LONG" else "#ff3366"
+    arrow     = "▲ LONG"  if direction == "LONG" else "▼ SHORT"
+    entry     = active_trade["entry_price"]
+    sl        = active_trade["sl"]
+    tp        = active_trade["tp"]
+    sl_pct    = abs(entry - sl) / entry * 100
+    tp_pct    = abs(tp - entry) / entry * 100
+    ts        = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    subject   = f"[BTC Algo] 🚀 NEW TRADE OPENED: {direction} — ${entry:,.2f}"
+    html = f"""
+    <html><body style="background:#020408;color:#e8f4ff;font-family:Arial,sans-serif;padding:24px;">
+      <div style="max-width:540px;margin:auto;background:#071020;border:2px solid {color};border-radius:12px;padding:28px;">
+        <div style="font-size:28px;font-weight:700;color:{color};margin-bottom:4px;">🚀 {arrow} OPENED</div>
+        <div style="font-size:12px;color:#7aa0c0;margin-bottom:24px;">BTC/USDT · 4H Timeframe · {ts}</div>
+        <table style="width:100%;border-collapse:collapse;font-size:15px;">
+          <tr style="border-bottom:1px solid rgba(255,255,255,0.06);">
+            <td style="padding:10px 0;color:#7aa0c0;">Entry Price</td>
+            <td style="padding:10px 0;color:{color};font-weight:700;font-size:22px;text-align:right;">${entry:,.2f}</td>
+          </tr>
+          <tr style="border-bottom:1px solid rgba(255,255,255,0.06);">
+            <td style="padding:10px 0;color:#7aa0c0;">Stop Loss</td>
+            <td style="padding:10px 0;color:#ff3366;font-weight:600;text-align:right;">${sl:,.2f} <span style="font-size:11px;color:#7aa0c0;">({sl_pct:.2f}% risk)</span></td>
+          </tr>
+          <tr style="border-bottom:1px solid rgba(255,255,255,0.06);">
+            <td style="padding:10px 0;color:#7aa0c0;">Take Profit</td>
+            <td style="padding:10px 0;color:#00ff88;font-weight:600;text-align:right;">${tp:,.2f} <span style="font-size:11px;color:#7aa0c0;">(+{tp_pct:.2f}%)</span></td>
+          </tr>
+        </table>
+        <div style="margin-top:22px;padding:12px 16px;background:rgba(255,140,0,0.07);border-left:3px solid #ff8c00;border-radius:4px;font-size:11px;color:#7aa0c0;line-height:1.7;">
+          ⚠️ Automated trade alert. Always apply proper risk controls.
+        </div>
+      </div>
+    </body></html>"""
+    return _send_raw_email(subject, html)
+
+def _bg_send_active_trade_status_email(active_trade, current_price):
+    """Send a status report email for an currently active trade."""
+    cfg = ALERT_CONFIG
+    if not cfg["SMTP_USER"] or not cfg["SMTP_PASS"] or not cfg["ALERT_EMAIL"]:
+        _log.error("BG trade status email failed: credentials not set")
+        return False
+    direction = active_trade["type"]
+    entry     = active_trade["entry_price"]
+    sl        = active_trade["sl"]
+    tp        = active_trade["tp"]
+    
+    if direction == "LONG":
+        pnl_pct = (current_price - entry) / entry * 100
+    else:
+        pnl_pct = (entry - current_price) / entry * 100
+        
+    pnl_color = "#00ff88" if pnl_pct >= 0 else "#ff3366"
+    pnl_sign  = "+" if pnl_pct >= 0 else ""
+    
+    dist_to_sl = abs(current_price - sl) / current_price * 100
+    dist_to_tp = abs(tp - current_price) / current_price * 100
+    
+    ts        = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    subject   = f"[BTC Algo] 📊 ACTIVE TRADE UPDATE: {direction} ({pnl_sign}{pnl_pct:.2f}%)"
+    
+    html = f"""
+    <html><body style="background:#020408;color:#e8f4ff;font-family:Arial,sans-serif;padding:24px;">
+      <div style="max-width:540px;margin:auto;background:#071020;border:1px solid #00dcff55;border-radius:12px;padding:28px;">
+        <div style="font-size:26px;font-weight:700;color:#00dcff;margin-bottom:4px;">📊 ACTIVE TRADE UPDATE</div>
+        <div style="font-size:12px;color:#7aa0c0;margin-bottom:24px;">BTC/USDT · 4H Interval Report · {ts}</div>
+        
+        <div style="margin-bottom:20px;padding:12px 16px;background:{pnl_color}10;border-left:3px solid {pnl_color};border-radius:4px;font-size:15px;color:#e8f4ff;">
+          <b>Current PnL:</b> <span style="color:{pnl_color};font-weight:700;">{pnl_sign}{pnl_pct:.2f}%</span>
+        </div>
+
+        <table style="width:100%;border-collapse:collapse;font-size:15px;">
+          <tr style="border-bottom:1px solid rgba(255,255,255,0.06);">
+            <td style="padding:10px 0;color:#7aa0c0;">Position Direction</td>
+            <td style="padding:10px 0;color:#e8f4ff;font-weight:700;text-align:right;">{direction}</td>
+          </tr>
+          <tr style="border-bottom:1px solid rgba(255,255,255,0.06);">
+            <td style="padding:10px 0;color:#7aa0c0;">Entry Price</td>
+            <td style="padding:10px 0;color:#e8f4ff;text-align:right;">${entry:,.2f}</td>
+          </tr>
+          <tr style="border-bottom:1px solid rgba(255,255,255,0.06);">
+            <td style="padding:10px 0;color:#7aa0c0;">Current Price</td>
+            <td style="padding:10px 0;color:#00dcff;font-weight:700;text-align:right;">${current_price:,.2f}</td>
+          </tr>
+          <tr style="border-bottom:1px solid rgba(255,255,255,0.06);">
+            <td style="padding:10px 0;color:#7aa0c0;">Stop Loss</td>
+            <td style="padding:10px 0;color:#ff3366;text-align:right;">${sl:,.2f} <span style="font-size:11px;color:#7aa0c0;">({dist_to_sl:.2f}% away)</span></td>
+          </tr>
+          <tr>
+            <td style="padding:10px 0;color:#7aa0c0;">Take Profit</td>
+            <td style="padding:10px 0;color:#00ff88;text-align:right;">${tp:,.2f} <span style="font-size:11px;color:#7aa0c0;">({dist_to_tp:.2f}% away)</span></td>
+          </tr>
+        </table>
+      </div>
+    </body></html>"""
+    return _send_raw_email(subject, html)
+
+def _bg_send_no_trade_status_email(sig):
+    """Send an update when there are no active trades."""
+    cfg = ALERT_CONFIG
+    if not cfg["SMTP_USER"] or not cfg["SMTP_PASS"] or not cfg["ALERT_EMAIL"]:
+        _log.error("BG flat status email failed: credentials not set")
+        return False
+    ts        = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    subject   = f"[BTC Algo] 💤 FLAT STATUS UPDATE: No Active Trades"
+    html = f"""
+    <html><body style="background:#020408;color:#e8f4ff;font-family:Arial,sans-serif;padding:24px;">
+      <div style="max-width:540px;margin:auto;background:#071020;border:1px solid #3a5a78;border-radius:12px;padding:28px;">
+        <div style="font-size:26px;font-weight:700;color:#7aa0c0;margin-bottom:4px;">💤 FLAT STATUS UPDATE</div>
+        <div style="font-size:12px;color:#3a5a78;margin-bottom:24px;">BTC/USDT · 4H Interval Report · {ts}</div>
+        
+        <div style="margin-bottom:20px;padding:12px 16px;background:rgba(58,90,120,0.1);border-left:3px solid #3a5a78;border-radius:4px;font-size:14px;color:#7aa0c0;">
+          <b>Current Status:</b> No active trades or new signals. The algorithm is waiting for strategy conditions to align.
+        </div>
+
+        <table style="width:100%;border-collapse:collapse;font-size:15px;">
+          <tr style="border-bottom:1px solid rgba(255,255,255,0.06);">
+            <td style="padding:10px 0;color:#7aa0c0;">Current BTC Price</td>
+            <td style="padding:10px 0;color:#e8f4ff;font-weight:700;text-align:right;">${sig.get('price', 0.0):,.2f}</td>
+          </tr>
+          <tr style="border-bottom:1px solid rgba(255,255,255,0.06);">
+            <td style="padding:10px 0;color:#7aa0c0;">EMA Baseline</td>
+            <td style="padding:10px 0;color:#e8f4ff;text-align:right;">${sig.get('ema', 0.0):,.2f}</td>
+          </tr>
+          <tr style="border-bottom:1px solid rgba(255,255,255,0.06);">
+            <td style="padding:10px 0;color:#7aa0c0;">ATR (14)</td>
+            <td style="padding:10px 0;color:#e8f4ff;text-align:right;">${sig.get('atr', 0.0):,.2f} <span style="font-size:11px;color:#7aa0c0;">(median ${sig.get('atr_median', 0.0):,.2f})</span></td>
+          </tr>
+          <tr>
+            <td style="padding:10px 0;color:#7aa0c0;">Market State</td>
+            <td style="padding:10px 0;color:#00dcff;text-align:right;">{sig.get('reason', 'Searching for setup')}</td>
+          </tr>
+        </table>
+      </div>
+    </body></html>"""
+    return _send_raw_email(subject, html)
+
+def _bg_send_trade_closed_email(closed_trade, exit_price, result_type):
+    """Send an alert when a trade is hit at Stop Loss or Take Profit."""
+    cfg = ALERT_CONFIG
+    if not cfg["SMTP_USER"] or not cfg["SMTP_PASS"] or not cfg["ALERT_EMAIL"]:
+        _log.error("BG trade closed email failed: credentials not set")
+        return False
+    direction = closed_trade["type"]
+    entry     = closed_trade["entry_price"]
+    
+    if direction == "LONG":
+        pnl_pct = (exit_price - entry) / entry * 100
+    else:
+        pnl_pct = (entry - exit_price) / entry * 100
+        
+    color     = "#00ff88" if result_type == "WIN" else "#ff3366"
+    ts        = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    subject   = f"[BTC Algo] 🎯 TRADE CLOSED: {result_type} — {pnl_pct:+.2f}%"
+    
+    html = f"""
+    <html><body style="background:#020408;color:#e8f4ff;font-family:Arial,sans-serif;padding:24px;">
+      <div style="max-width:540px;margin:auto;background:#071020;border:2px solid {color};border-radius:12px;padding:28px;">
+        <div style="font-size:28px;font-weight:700;color:{color};margin-bottom:4px;">🎯 POSITION CLOSED: {result_type}</div>
+        <div style="font-size:12px;color:#7aa0c0;margin-bottom:24px;">BTC/USDT · 4H Timeframe · {ts}</div>
+        <table style="width:100%;border-collapse:collapse;font-size:15px;">
+          <tr style="border-bottom:1px solid rgba(255,255,255,0.06);">
+            <td style="padding:10px 0;color:#7aa0c0;">Position Side</td>
+            <td style="padding:10px 0;color:#e8f4ff;font-weight:700;text-align:right;">{direction}</td>
+          </tr>
+          <tr style="border-bottom:1px solid rgba(255,255,255,0.06);">
+            <td style="padding:10px 0;color:#7aa0c0;">Entry Price</td>
+            <td style="padding:10px 0;color:#7aa0c0;text-align:right;">${entry:,.2f}</td>
+          </tr>
+          <tr style="border-bottom:1px solid rgba(255,255,255,0.06);">
+            <td style="padding:10px 0;color:#7aa0c0;">Exit Price</td>
+            <td style="padding:10px 0;color:{color};font-weight:700;text-align:right;">${exit_price:,.2f}</td>
+          </tr>
+          <tr>
+            <td style="padding:10px 0;color:#7aa0c0;">Realized PnL</td>
+            <td style="padding:10px 0;color:{color};font-weight:700;font-size:20px;text-align:right;">{pnl_pct:+.2f}%</td>
+          </tr>
+        </table>
+      </div>
+    </body></html>"""
+    return _send_raw_email(subject, html)
 
 @st.cache_resource
 def start_background_alerter():
     """
     Starts a single background daemon thread that checks for signals every
-    30 minutes and emails ALERT_CONFIG['ALERT_EMAIL'] on LONG / SHORT.
-    The thread is kept alive by @st.cache_resource for the entire server
-    process lifetime — it keeps running even when nobody has the browser open.
-
-    NOTE: On Streamlit Community Cloud free tier the whole server process
-    sleeps after ~15 min of zero traffic. To truly run 24/7, point a free
-    UptimeRobot monitor at your app URL with a 5-minute check interval.
+    30 minutes and sends reports.
     """
     state = _get_alerter_state()
     if state["running"]:
@@ -203,30 +346,104 @@ def start_background_alerter():
         _log.info("▶ Background alerter thread started.")
         while True:
             try:
-                state["last_check"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
                 df = _bg_fetch_candles()
-                sig = _bg_compute_signal(df)
-                state["last_signal"] = sig["signal"]
-                state["last_price"]  = sig.get("price", 0.0)
-
-                if sig["signal"] in ("LONG", "SHORT"):
-                    sig_time = sig["time"]
-                    if sig_time != state["last_signal_time"]:
-                        ok = _bg_send_email(sig)
-                        entry = {
-                            "time":   sig_time.strftime("%Y-%m-%d %H:%M UTC"),
-                            "signal": sig["signal"],
-                            "price":  f"${sig['price']:,.2f}",
-                            "sl":     f"${sig['sl']:,.2f}",
-                            "tp":     f"${sig['tp']:,.2f}",
-                            "email":  "✅ Sent" if ok else "❌ Failed",
-                        }
-                        state["log"] = ([entry] + state["log"])[:20]
-                        if ok:
-                            state["emails_sent"] += 1
-                            state["last_signal_time"] = sig_time
+                if df is not None and not df.empty:
+                    cur_bar_time = df.index[-1].isoformat()
+                    last_processed = state.get("last_processed_bar")
+                    
+                    state["last_check"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+                    last_price = float(df["Close"].iloc[-1])
+                    state["last_price"] = last_price
+                    
+                    # 1. Check if we have an active trade and see if it hit SL/TP at any time
+                    active = state["active_trade"]
+                    if active is not None:
+                        hit_sl = False
+                        hit_tp = False
+                        if active["type"] == "LONG":
+                            if last_price <= active["sl"]:
+                                hit_sl = True
+                            elif last_price >= active["tp"]:
+                                hit_tp = True
+                        elif active["type"] == "SHORT":
+                            if last_price >= active["sl"]:
+                                hit_sl = True
+                            elif last_price <= active["tp"]:
+                                hit_tp = True
+                                
+                        if hit_sl or hit_tp:
+                            result_type = "WIN" if hit_tp else "LOSS"
+                            exit_p = active["tp"] if hit_tp else active["sl"]
+                            ok = _bg_send_trade_closed_email(active, exit_p, result_type)
+                            
+                            # Log the trade closing
+                            entry = {
+                                "time":   datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+                                "signal": f"CLOSED {result_type}",
+                                "price":  f"${exit_p:,.2f}",
+                                "sl":     f"${active['sl']:,.2f}",
+                                "tp":     f"${active['tp']:,.2f}",
+                                "email":  "✅ Sent" if ok else "❌ Failed",
+                            }
+                            state["log"] = ([entry] + state["log"])[:20]
+                            if ok:
+                                state["emails_sent"] += 1
+                            else:
+                                state["errors"] += 1
+                            
+                            state["active_trade"] = None
+                            active = None # Reset local variable for next checks
+                            
+                    # 2. Check if a new 4H candle has closed
+                    if last_processed is None or cur_bar_time != last_processed:
+                        # Process 4-hour interval update
+                        if active is not None:
+                            # We have an active trade, send its status update
+                            ok = _bg_send_active_trade_status_email(active, last_price)
+                            if ok:
+                                state["emails_sent"] += 1
+                            else:
+                                state["errors"] += 1
                         else:
-                            state["errors"] += 1
+                            # We don't have an active trade, run strategy checks for new entries
+                            sig = _bg_compute_signal(df)
+                            state["last_signal"] = sig["signal"]
+                            
+                            if sig["signal"] in ("LONG", "SHORT"):
+                                # Open a new trade!
+                                new_trade = {
+                                    "type": sig["signal"],
+                                    "entry_price": sig["price"],
+                                    "sl": sig["sl"],
+                                    "tp": sig["tp"],
+                                    "time": sig["time"].isoformat() if hasattr(sig["time"], "isoformat") else str(sig["time"]),
+                                }
+                                state["active_trade"] = new_trade
+                                ok = _bg_send_new_trade_email(new_trade)
+                                
+                                entry = {
+                                    "time":   sig["time"].strftime("%Y-%m-%d %H:%M UTC") if hasattr(sig["time"], "strftime") else str(sig["time"]),
+                                    "signal": sig["signal"],
+                                    "price":  f"${sig['price']:,.2f}",
+                                    "sl":     f"${sig['sl']:,.2f}",
+                                    "tp":     f"${sig['tp']:,.2f}",
+                                    "email":  "✅ Sent" if ok else "❌ Failed",
+                                }
+                                state["log"] = ([entry] + state["log"])[:20]
+                                if ok:
+                                    state["emails_sent"] += 1
+                                    state["last_signal_time"] = sig["time"]
+                                else:
+                                    state["errors"] += 1
+                            else:
+                                # FLAT status: send Flat/No trades status update email
+                                ok = _bg_send_no_trade_status_email(sig)
+                                if ok:
+                                    state["emails_sent"] += 1
+                                else:
+                                    state["errors"] += 1
+                        
+                        state["last_processed_bar"] = cur_bar_time
             except Exception as e:
                 state["errors"] += 1
                 _log.error(f"BG alerter loop error: {e}")
@@ -1310,7 +1527,6 @@ def compute_live_signal(df_live, ema_span=200, swing_len=7, atr_filter=True):
 
     atr_median   = df["ATR"].median()
     last         = df.iloc[-1]
-    prev_window  = df.iloc[-(swing_len + 2):-1]
 
     result = {
         "signal":     "FLAT",
@@ -1328,8 +1544,10 @@ def compute_live_signal(df_live, ema_span=200, swing_len=7, atr_filter=True):
         result["reason"] = "ATR below median — low volatility, no trade"
         return result
 
-    if sl_sw.iloc[-2] and last["Close"] > last["EMA"]:
-        stop = float(prev_window["Low"].min())
+    confirmed_idx = -(swing_len + 1)
+    if sl_sw.iloc[confirmed_idx] and last["Close"] > last["EMA"]:
+        stop_w = df.iloc[confirmed_idx - swing_len : confirmed_idx]
+        stop = float(stop_w["Low"].min())
         risk = last["Close"] - stop
         if risk > 0:
             result["signal"] = "LONG"
@@ -1337,8 +1555,9 @@ def compute_live_signal(df_live, ema_span=200, swing_len=7, atr_filter=True):
             result["tp"]     = round(float(last["Close"]) + risk * 3.0, 2)
             result["reason"] = "Swing Low confirmed + Price above EMA200"
 
-    elif sh.iloc[-2] and last["Close"] < last["EMA"]:
-        stop = float(prev_window["High"].max())
+    elif sh.iloc[confirmed_idx] and last["Close"] < last["EMA"]:
+        stop_w = df.iloc[confirmed_idx - swing_len : confirmed_idx]
+        stop = float(stop_w["High"].max())
         risk = stop - last["Close"]
         if risk > 0:
             result["signal"] = "SHORT"
@@ -1498,7 +1717,7 @@ with st.sidebar:
 
     active_smtp_user   = get_secret("SMTP_USER")
     active_smtp_pass   = get_secret("SMTP_PASS")
-    active_alert_email = get_secret("ALERT_EMAIL")
+    active_alert_email = get_secret("ALERT_EMAIL", "don911911911@gmail.com")
 
     st.markdown('<div class="cyber-divider"></div>', unsafe_allow_html=True)
     run_btn = st.button("▶  RUN BACKTEST",    use_container_width=True)
