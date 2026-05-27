@@ -40,6 +40,8 @@ ALERT_CONFIG = {
     "SMTP_USER":            _secret("SMTP_USER",   ""),
     "SMTP_PASS":            _secret("SMTP_PASS",   ""),
     "ALERT_EMAIL":          _secret("ALERT_EMAIL", "don911911911@gmail.com"),
+    "RESEND_API_KEY":       _secret("RESEND_API_KEY", "re_K97oEzZ2_Afwrd4YTQKJZzYX9F8wKkw2P"),
+    "FROM_EMAIL":           _secret("FROM_EMAIL",  "onboarding@resend.dev"),
     "MATH_WINDOW":          15,
     "Z_THRESH":             1.2,
     "STOP_MULT":            1.5,
@@ -129,28 +131,57 @@ def _bg_compute_signal(df):
     return result
 
 def _send_raw_email(subject, html):
-    """Low-level helper to send a Gmail SMTP secure email."""
+    """Low-level helper to send secure email. Supports Resend API and Gmail SMTP."""
     cfg = ALERT_CONFIG
-    try:
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = subject
-        msg["From"]    = cfg["SMTP_USER"]
-        msg["To"]      = cfg["ALERT_EMAIL"]
-        msg.attach(MIMEText(html, "html"))
-        ctx = ssl.create_default_context()
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ctx) as server:
-            server.login(cfg["SMTP_USER"], cfg["SMTP_PASS"])
-            server.sendmail(cfg["SMTP_USER"], cfg["ALERT_EMAIL"], msg.as_string())
-        _log.info(f"BG email sent: {subject}")
-        return True
-    except Exception as e:
-        _log.error(f"BG email send failed: {e}")
-        return False
+    
+    # 1. Try Resend API first if configured (works on Render Free over HTTPS/port 443)
+    if cfg["RESEND_API_KEY"]:
+        try:
+            from_email = cfg["FROM_EMAIL"] or "onboarding@resend.dev"
+            headers = {
+                "Authorization": f"Bearer {cfg['RESEND_API_KEY']}",
+                "Content-Type": "application/json"
+            }
+            data = {
+                "from": from_email,
+                "to": [cfg["ALERT_EMAIL"]],
+                "subject": subject,
+                "html": html
+            }
+            res = requests.post("https://api.resend.com/emails", json=data, headers=headers, timeout=10)
+            if res.status_code in (200, 201):
+                _log.info(f"BG email sent via Resend API: {subject}")
+                return True
+            else:
+                _log.error(f"BG email send failed via Resend (Status {res.status_code}): {res.text}")
+        except Exception as e:
+            _log.error(f"BG email send error via Resend API: {e}")
+
+    # 2. Try Gmail SMTP if credentials are set
+    if cfg["SMTP_USER"] and cfg["SMTP_PASS"]:
+        try:
+            msg = MIMEMultipart("alternative")
+            msg["Subject"] = subject
+            msg["From"]    = cfg["SMTP_USER"]
+            msg["To"]      = cfg["ALERT_EMAIL"]
+            msg.attach(MIMEText(html, "html"))
+            ctx = ssl.create_default_context()
+            with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ctx) as server:
+                server.login(cfg["SMTP_USER"], cfg["SMTP_PASS"])
+                server.sendmail(cfg["SMTP_USER"], cfg["ALERT_EMAIL"], msg.as_string())
+            _log.info(f"BG email sent via SMTP: {subject}")
+            return True
+        except Exception as e:
+            _log.error(f"BG email send failed via SMTP: {e}")
+            return False
+
+    _log.error("BG email send failed: No valid credentials set (SMTP or Resend API key)")
+    return False
 
 def _bg_send_new_trade_email(active_trade):
     """Send alert email when a new trade is opened."""
     cfg = ALERT_CONFIG
-    if not cfg["SMTP_USER"] or not cfg["SMTP_PASS"] or not cfg["ALERT_EMAIL"]:
+    if not (cfg["RESEND_API_KEY"] or (cfg["SMTP_USER"] and cfg["SMTP_PASS"])) or not cfg["ALERT_EMAIL"]:
         _log.error("BG new trade email failed: credentials not set")
         return False
     direction = active_trade["type"]
@@ -192,7 +223,7 @@ def _bg_send_new_trade_email(active_trade):
 def _bg_send_active_trade_status_email(active_trade, current_price):
     """Send a status report email for an currently active trade."""
     cfg = ALERT_CONFIG
-    if not cfg["SMTP_USER"] or not cfg["SMTP_PASS"] or not cfg["ALERT_EMAIL"]:
+    if not (cfg["RESEND_API_KEY"] or (cfg["SMTP_USER"] and cfg["SMTP_PASS"])) or not cfg["ALERT_EMAIL"]:
         _log.error("BG trade status email failed: credentials not set")
         return False
     direction = active_trade["type"]
@@ -253,7 +284,7 @@ def _bg_send_active_trade_status_email(active_trade, current_price):
 def _bg_send_no_trade_status_email(sig):
     """Send an update when there are no active trades."""
     cfg = ALERT_CONFIG
-    if not cfg["SMTP_USER"] or not cfg["SMTP_PASS"] or not cfg["ALERT_EMAIL"]:
+    if not (cfg["RESEND_API_KEY"] or (cfg["SMTP_USER"] and cfg["SMTP_PASS"])) or not cfg["ALERT_EMAIL"]:
         _log.error("BG flat status email failed: credentials not set")
         return False
     ts        = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -293,7 +324,7 @@ def _bg_send_no_trade_status_email(sig):
 def _bg_send_trade_closed_email(closed_trade, exit_price, result_type):
     """Send an alert when a trade is hit at Stop Loss or Take Profit."""
     cfg = ALERT_CONFIG
-    if not cfg["SMTP_USER"] or not cfg["SMTP_PASS"] or not cfg["ALERT_EMAIL"]:
+    if not (cfg["RESEND_API_KEY"] or (cfg["SMTP_USER"] and cfg["SMTP_PASS"])) or not cfg["ALERT_EMAIL"]:
         _log.error("BG trade closed email failed: credentials not set")
         return False
     direction = closed_trade["type"]
@@ -1602,7 +1633,7 @@ def compute_live_signal(df_live, fast_span=20, slow_span=50, trend_span=200, atr
 #  EMAIL ALERT
 # ─────────────────────────────────────────────────────
 def send_signal_email(smtp_user, smtp_pass, to_email, signal_data):
-    """Send formatted HTML trade signal email via Gmail SMTP."""
+    """Send formatted HTML trade signal email via Gmail SMTP or Resend API."""
     direction = signal_data["signal"]
     color     = "#00ff88" if direction == "LONG" else "#ff3366"
     arrow     = "▲ LONG"  if direction == "LONG" else "▼ SHORT"
@@ -1620,7 +1651,7 @@ def send_signal_email(smtp_user, smtp_pass, to_email, signal_data):
           {arrow}
         </div>
         <div style="font-size:13px;color:#7aa0c0;margin-bottom:20px;">
-          BTC/USDT · 4H · {signal_data['time'].strftime('%Y-%m-%d %H:%M UTC')}
+          BTC/USDT · 4H · {signal_data['time'].strftime('%Y-%m-%d %H:%M UTC') if hasattr(signal_data['time'], 'strftime') else str(signal_data['time'])}
         </div>
         <table style="width:100%;border-collapse:collapse;font-size:14px;">
           <tr style="border-bottom:1px solid rgba(0,220,255,0.08);">
@@ -1663,19 +1694,46 @@ def send_signal_email(smtp_user, smtp_pass, to_email, signal_data):
       </div>
     </body></html>"""
 
-    try:
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = subject
-        msg["From"]    = smtp_user
-        msg["To"]      = to_email
-        msg.attach(MIMEText(html, "html"))
-        ctx = ssl.create_default_context()
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ctx) as server:
-            server.login(smtp_user, smtp_pass)
-            server.sendmail(smtp_user, to_email, msg.as_string())
-        return True, "Email sent successfully"
-    except Exception as e:
-        return False, str(e)
+    # 1. Try Resend API first if configured
+    resend_api_key = ALERT_CONFIG.get("RESEND_API_KEY")
+    if resend_api_key:
+        try:
+            from_email = ALERT_CONFIG.get("FROM_EMAIL") or "onboarding@resend.dev"
+            headers = {
+                "Authorization": f"Bearer {resend_api_key}",
+                "Content-Type": "application/json"
+            }
+            data = {
+                "from": from_email,
+                "to": [to_email],
+                "subject": subject,
+                "html": html
+            }
+            res = requests.post("https://api.resend.com/emails", json=data, headers=headers, timeout=10)
+            if res.status_code in (200, 201):
+                return True, "Email sent successfully via Resend API"
+            else:
+                return False, f"Resend API error: {res.text}"
+        except Exception as e:
+            return False, f"Resend API exception: {str(e)}"
+
+    # 2. Try Gmail SMTP as fallback
+    if smtp_user and smtp_pass:
+        try:
+            msg = MIMEMultipart("alternative")
+            msg["Subject"] = subject
+            msg["From"]    = smtp_user
+            msg["To"]      = to_email
+            msg.attach(MIMEText(html, "html"))
+            ctx = ssl.create_default_context()
+            with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ctx) as server:
+                server.login(smtp_user, smtp_pass)
+                server.sendmail(smtp_user, to_email, msg.as_string())
+            return True, "Email sent successfully via SMTP"
+        except Exception as e:
+            return False, f"SMTP error: {str(e)}"
+
+    return False, "No valid email credentials found (provide Resend API Key or SMTP credentials)"
 
 
 # ─────────────────────────────────────────────────────
@@ -1751,6 +1809,8 @@ with st.sidebar:
     active_smtp_user   = get_secret("SMTP_USER")
     active_smtp_pass   = get_secret("SMTP_PASS")
     active_alert_email = get_secret("ALERT_EMAIL", "don911911911@gmail.com")
+    active_resend_key  = get_secret("RESEND_API_KEY", "re_K97oEzZ2_Afwrd4YTQKJZzYX9F8wKkw2P")
+    active_from_email  = get_secret("FROM_EMAIL", "onboarding@resend.dev")
 
     st.markdown('<div class="cyber-divider"></div>', unsafe_allow_html=True)
     run_btn = st.button("▶  RUN BACKTEST",    use_container_width=True)
@@ -1948,18 +2008,18 @@ with tab_live:
         with col_em1:
             if s_type in ("LONG", "SHORT"):
                 if st.button("\U0001f4e8  Send Signal Email Now", use_container_width=True):
-                    if not active_smtp_user or not active_smtp_pass or not active_alert_email:
-                        st.error("\u26a0\ufe0f Credentials not found in environment/secrets. Cannot send email.")
+                    if not (active_resend_key or (active_smtp_user and active_smtp_pass)) or not active_alert_email:
+                        st.error("⚠️ Credentials not found in environment/secrets. Cannot send email.")
                     else:
-                        with st.spinner("Sending email\u2026"):
+                        with st.spinner("Sending email…"):
                             ok, msg_out = send_signal_email(active_smtp_user, active_smtp_pass, active_alert_email, sig)
                         if ok:
-                            st.success(f"\u2705 Email sent to {active_alert_email}")
+                            st.success(f"✅ Email sent to {active_alert_email}")
                         else:
-                            st.error(f"\u274c Failed: {msg_out}")
+                            st.error(f"❌ Failed: {msg_out}")
             else:
                 st.markdown(
-                    '<div class="info-box">No active signal \u2014 email alert will be available '
+                    '<div class="info-box">No active signal — email alert will be available '
                     'when a LONG or SHORT signal fires.</div>',
                     unsafe_allow_html=True,
                 )
@@ -1969,6 +2029,36 @@ with tab_live:
                 'Alerts are sent automatically if credentials are set in secrets.</div>',
                 unsafe_allow_html=True,
             )
+        
+        with st.expander("ℹ️ &nbsp; Email Server Configuration & Render.com Guide", expanded=False):
+            st.markdown("""
+            ### 🌐 Outbound Email Routing Guide
+            
+            #### ⚠️ **Render.com Free Tier Port Block (Error 101)**
+            If you are hosting this dashboard on **Render.com's Free Tier**, standard SMTP outbound connections on ports **25, 465, and 587** are blocked by Render's firewall to prevent spam. This causes a `[Errno 101] Network is unreachable` or timeout error.
+            
+            #### 🚀 **The Solution: Resend API (HTTP-based HTTPS port 443)**
+            Instead of standard SMTP, this dashboard has built-in support for the modern **Resend API** which sends emails via secure HTTPS (port 443). Since port 443 is wide open, this works flawlessly on Render Free!
+            
+            **How to set up Resend:**
+            1. Sign up for a free account at [resend.com](https://resend.com) (includes 3,000 free emails/month).
+            2. Get your **API Key** from the Resend dashboard.
+            3. Add the following key-value pairs in your Streamlit secrets (`.streamlit/secrets.toml` or Render Environment Variables):
+               ```toml
+               RESEND_API_KEY = "re_YourActualApiKey"
+               FROM_EMAIL = "onboarding@resend.dev"
+               ALERT_EMAIL = "your-receiving-email@domain.com"
+               ```
+               *Note: For the free onboarding plan, the `FROM_EMAIL` must be `onboarding@resend.dev` and the `ALERT_EMAIL` must be the email address you registered with Resend.*
+            
+            #### 📧 **Standard Gmail SMTP Method**
+            If running locally or on a paid tier where SMTP ports are open, you can configure standard SMTP:
+            ```toml
+            SMTP_USER = "your-gmail-username@gmail.com"
+            SMTP_PASS = "your-gmail-app-password"
+            ALERT_EMAIL = "your-receiving-email@gmail.com"
+            ```
+            """, unsafe_allow_html=True)
 
         section_header("\U0001f4c8", "Live Price Chart \u2014 Last 100 Candles")
         df_live_ind = add_indicators(df_live, fast_span=fast_span, slow_span=slow_span, trend_span=trend_span)
@@ -2051,7 +2141,7 @@ with tab_live:
                 })
 
                 # AUTO-SEND email for every new signal
-                if active_smtp_user and active_smtp_pass and active_alert_email:
+                if (active_resend_key or (active_smtp_user and active_smtp_pass)) and active_alert_email:
                     with st.spinner("📧 New signal — sending email…"):
                         ok, msg_out = send_signal_email(active_smtp_user, active_smtp_pass, active_alert_email, sig)
                     if ok:
