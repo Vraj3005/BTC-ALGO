@@ -1244,11 +1244,10 @@ def backtest(df, fast_span, risk_pct, rr, initial_capital,
         else:
             risk_amount = capital * (risk_pct / 100)
             
-            # Mathematical Z-Score triggers
-            # LONG when Z crosses above z_thresh
-            long_cross = (prev_row["Z"] <= z_thresh) and (row["Z"] > z_thresh)
-            # SHORT when Z crosses below -z_thresh
-            short_cross = (prev_row["Z"] >= -z_thresh) and (row["Z"] < -z_thresh)
+            # Mathematical Z-Score triggers (0% Look-ahead bias, strictly completed candles)
+            prev_prev_row = df.iloc[i-2]
+            long_cross = (prev_prev_row["Z"] <= z_thresh) and (prev_row["Z"] > z_thresh)
+            short_cross = (prev_prev_row["Z"] >= -z_thresh) and (prev_row["Z"] < -z_thresh)
             
             if long_cross:
                 entry_p = row["Open"] * (1 + slippage) # Enter at the open of current candle
@@ -1556,15 +1555,17 @@ def fetch_live_candles(symbol="BTCUSDT", interval="4h", limit=300):
     """Latest 300 candles for the live chart and signal (Bybit → OKX fallback)."""
     return _fetch_latest_candles(limit=limit)
 
-def compute_live_signal(df_live, fast_span=20, slow_span=50, trend_span=200, atr_mult=1.5, rr=3.0):
-    """Run EMA crossover strategy on live candles. Returns signal dict."""
-    if df_live is None or len(df_live) < trend_span + 50:
+def compute_live_signal(df_live, fast_span=15, slow_span=1.2, trend_span=200, atr_mult=1.5, rr=2.5):
+    """Run Detrended Rolling Z-Score mathematical strategy on live candles. Returns signal dict."""
+    window = int(fast_span)
+    z_thresh = float(slow_span)
+    if df_live is None or len(df_live) < window + 10:
         return {"signal": "NO DATA", "reason": "Not enough candles",
                 "price": 0, "ema": 0, "atr": 0, "atr_median": 0,
                 "time": pd.Timestamp.utcnow(), "sl": None, "tp": None}
 
     df = df_live.copy()
-    df = add_indicators(df, fast_span=fast_span, slow_span=slow_span, trend_span=trend_span)
+    df = add_indicators(df, fast_span=window, slow_span=z_thresh)
     
     last_idx = -2
     prev_idx = -3
@@ -1573,60 +1574,46 @@ def compute_live_signal(df_live, fast_span=20, slow_span=50, trend_span=200, atr
     prev_row = df.iloc[prev_idx]
     current_row = df.iloc[-1]
     
-    long_cross = (prev_row["EMA_Fast"] <= prev_row["EMA_Slow"]) and (last_row["EMA_Fast"] > last_row["EMA_Slow"])
-    short_cross = (prev_row["EMA_Fast"] >= prev_row["EMA_Slow"]) and (last_row["EMA_Fast"] < last_row["EMA_Slow"])
+    # LONG: Z crosses above Z_THRESH
+    long_cross = (prev_row["Z"] <= z_thresh) and (last_row["Z"] > z_thresh)
+    # SHORT: Z crosses below -Z_THRESH
+    short_cross = (prev_row["Z"] >= -z_thresh) and (last_row["Z"] < -z_thresh)
     
     result = {
         "signal":     "FLAT",
         "price":      round(float(current_row["Close"]), 2),
-        "ema":        round(float(last_row["EMA_Trend"]), 2),
-        "atr":        round(float(last_row["ATR"]), 2),
-        "atr_median": round(float(df["ATR"].median()), 2),
+        "ema":        round(float(last_row["mu"]), 2),
+        "atr":        round(float(last_row["sigma"]), 2),
+        "atr_median": round(float(df["sigma"].median()), 2),
         "time":       df.index[last_idx],
-        "reason":     "Flat market / No crossover signals",
+        "reason":     "Z-score within normal statistical boundaries",
         "sl":         None,
         "tp":         None,
     }
 
-    macd_bullish = last_row["MACD_Hist"] > 0
-    macd_bearish = last_row["MACD_Hist"] < 0
-    rsi_bullish = 50 <= last_row["RSI"] <= 65
-    rsi_bearish = 35 <= last_row["RSI"] <= 50
-
     if long_cross:
-        if last_row["Close"] > last_row["EMA_Trend"]:
-            if macd_bullish and rsi_bullish:
-                atr_val = float(last_row["ATR"])
-                stop = float(current_row["Close"] - atr_val * atr_mult)
-                risk = current_row["Close"] - stop
-                result.update({
-                    "signal": "LONG",
-                    "sl":     round(stop, 2),
-                    "tp":     round(float(current_row["Close"]) + risk * rr, 2),
-                    "reason": "EMA 20/50 Bullish Cross + MACD/RSI Confirmed",
-                })
-            else:
-                result["reason"] = f"Bullish Cross rejected by MACD/RSI (RSI: {last_row['RSI']:.1f}, Hist: {last_row['MACD_Hist']:.4f})"
-        else:
-            result["reason"] = "Bullish Cross occurred below EMA Trend Baseline"
-            
+        vol = float(last_row["sigma"])
+        stop = float(current_row["Close"] - vol * atr_mult)
+        risk = current_row["Close"] - stop
+        if risk > 0:
+            result.update({
+                "signal": "LONG",
+                "sl":     round(stop, 2),
+                "tp":     round(float(current_row["Close"]) + risk * rr, 2),
+                "reason": f"Z-Score positive momentum breakout ({last_row['Z']:.2f})"
+            })
     elif short_cross:
-        if last_row["Close"] < last_row["EMA_Trend"]:
-            if macd_bearish and rsi_bearish:
-                atr_val = float(last_row["ATR"])
-                stop = float(current_row["Close"] + atr_val * atr_mult)
-                risk = stop - current_row["Close"]
-                result.update({
-                    "signal": "SHORT",
-                    "sl":     round(stop, 2),
-                    "tp":     round(float(current_row["Close"]) - risk * rr, 2),
-                    "reason": "EMA 20/50 Bearish Cross + MACD/RSI Confirmed",
-                })
-            else:
-                result["reason"] = f"Bearish Cross rejected by MACD/RSI (RSI: {last_row['RSI']:.1f}, Hist: {last_row['MACD_Hist']:.4f})"
-        else:
-            result["reason"] = "Bearish Cross occurred above EMA Trend Baseline"
-
+        vol = float(last_row["sigma"])
+        stop = float(current_row["Close"] + vol * atr_mult)
+        risk = stop - current_row["Close"]
+        if risk > 0:
+            result.update({
+                "signal": "SHORT",
+                "sl":     round(stop, 2),
+                "tp":     round(float(current_row["Close"]) - risk * rr, 2),
+                "reason": f"Z-Score negative momentum breakout ({last_row['Z']:.2f})"
+            })
+            
     return result
 
 # ─────────────────────────────────────────────────────
