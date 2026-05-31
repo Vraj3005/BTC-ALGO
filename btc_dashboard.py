@@ -1,515 +1,323 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import random
 import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
-from datetime import datetime, timedelta, timezone
-import io
+from datetime import datetime, timedelta, timezone, date as _date
 import requests
-import smtplib
-import ssl
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+import json
+import os
 import time
 import threading
-import os
 import logging
+# Email imports removed
 from streamlit_autorefresh import st_autorefresh
 
-# ─────────────────────────────────────────────────────
-#  ALERT CONFIG
-#  Credentials are read (in priority order) from:
-#    1. Streamlit Secrets  (.streamlit/secrets.toml)
-#    2. Environment variables
-#    3. Hard-coded fallbacks below
-#
-#  For Streamlit Cloud → add to App Secrets (Settings):
+# Import our custom modules
+import data_loader
+import indicators
+import backtester
 
 # ─────────────────────────────────────────────────────
+# Logging Setup
+# ─────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+logger = logging.getLogger("btc_dashboard")
 
+# File paths
+STRATEGY_FILE = "active_strategy.json"
+STATE_FILE = "alerter_state.json"
 
-def _secret(key, fallback):
+# ─────────────────────────────────────────────────────
+# Strategy & Alerter State Management
+# ─────────────────────────────────────────────────────
+def load_active_strategy_from_disk():
+    if os.path.exists(STRATEGY_FILE):
+        try:
+            with open(STRATEGY_FILE, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.error(f"Error reading strategy file: {e}")
+    return None
+
+def save_active_strategy_to_disk(strategy):
     try:
-        return st.secrets[key]
-    except Exception:
-        return os.getenv(key, fallback)
-    
-ALERT_CONFIG = {
-    "SMTP_USER":            _secret("SMTP_USER",   ""),
-    "SMTP_PASS":            _secret("SMTP_PASS",   ""),
-    "ALERT_EMAIL":          _secret("ALERT_EMAIL", "don911911911@gmail.com"),
-    "RESEND_API_KEY":       _secret("RESEND_API_KEY", "re_K97oEzZ2_Afwrd4YTQKJZzYX9F8wKkw2P"),
-    "FROM_EMAIL":           _secret("FROM_EMAIL",  "onboarding@resend.dev"),
-    "MATH_WINDOW":          15,
-    "Z_THRESH":             1.2,
-    "STOP_MULT":            1.5,
-    "RR":                   2.5,
-    "CHECK_EVERY_SECONDS":  1800,   # check every 30 min
-}
+        with open(STRATEGY_FILE, "w") as f:
+            json.dump(strategy, f, indent=4)
+        return True
+    except Exception as e:
+        logger.error(f"Error writing strategy: {e}")
+    return False
 
-# ─────────────────────────────────────────────────────
-#  BACKGROUND ALERTER  (runs 24/7 independent of UI)
-# ─────────────────────────────────────────────────────
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s  %(levelname)-8s  %(message)s",
-                    datefmt="%Y-%m-%d %H:%M:%S")
-_log = logging.getLogger("btc_bg_alerter")
+def load_alerter_state_from_disk():
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r") as f:
+                data = json.load(f)
+                return data
+        except Exception as e:
+            logger.error(f"Error reading alerter state: {e}")
+    return None
+
+def save_alerter_state_to_disk(state):
+    try:
+        data = state.copy()
+        if data.get("last_signal_time") and hasattr(data["last_signal_time"], "isoformat"):
+            data["last_signal_time"] = data["last_signal_time"].isoformat()
+        with open(STATE_FILE, "w") as f:
+            json.dump(data, f, indent=4)
+    except Exception as e:
+        logger.error(f"Error writing alerter state: {e}")
 
 @st.cache_resource
 def _get_alerter_state():
-    """Shared mutable dict kept alive for the lifetime of the server process."""
+    disk_state = load_alerter_state_from_disk()
+    if disk_state:
+        # Re-parse datetimes
+        if disk_state.get("last_signal_time"):
+            try:
+                disk_state["last_signal_time"] = pd.Timestamp(disk_state["last_signal_time"])
+            except:
+                pass
+        return disk_state
+        
     return {
-        "running":            False,
-        "last_signal_time":   None,
-        "last_check":         None,
-        "last_signal":        "—",
-        "last_price":         0.0,
-        "emails_sent":        0,
-        "errors":             0,
-        "log":                [],          # last 20 entries
-        "active_trade":       None,        # Track open trade: {"type": "LONG"/"SHORT", "entry_price": float, "sl": float, "tp": float, "time": str}
-        "last_processed_bar": None,        # open time of the last processed candle
+        "running": False,
+        "last_signal_time": None,
+        "last_check": None,
+        "last_signal": "—",
+        "last_price": 0.0,
+        "errors": 0,
+        "log": [],
+        "active_trade": None, # open position details
+        "last_processed_bar": None,
     }
 
-def _bg_fetch_candles():
-    """Fetch latest 300 4H candles for background alerter (Bybit → OKX fallback)."""
-    df, _ = _fetch_latest_candles(limit=300)
-    return df
+# Email notification features removed.
 
-def _bg_compute_signal(df):
-    """Run Detrended Rolling Z-Score mathematical strategy (background thread version)."""
-    cfg = ALERT_CONFIG
-    window = cfg["MATH_WINDOW"]
-    if df is None or len(df) < window + 10:
-        return {"signal": "NO DATA"}
-        
-    df = df.copy()
-    df = add_math_metrics(df, window=window)
+# ─────────────────────────────────────────────────────
+# 24/7 Daemon Alerter Worker Loop
+# ─────────────────────────────────────────────────────
+def background_alerter_loop():
+    state = _get_alerter_state()
+    state["running"] = True
+    logger.info("▶ Background alerter thread loop started.")
     
-    last_idx = -2
-    prev_idx = -3
-    
-    last_row = df.iloc[last_idx]
-    prev_row = df.iloc[prev_idx]
-    current_row = df.iloc[-1]
-    
-    # LONG: Z crosses above Z_THRESH
-    long_cross = (prev_row["Z"] <= cfg["Z_THRESH"]) and (last_row["Z"] > cfg["Z_THRESH"])
-    # SHORT: Z crosses below -Z_THRESH
-    short_cross = (prev_row["Z"] >= -cfg["Z_THRESH"]) and (last_row["Z"] < -cfg["Z_THRESH"])
-    
-    result = {
-        "signal": "FLAT", "price": round(float(current_row["Close"]), 2),
-        "mu": round(float(last_row["mu"]), 2), "sigma": round(float(last_row["sigma"]), 2),
-        "time": df.index[last_idx],
-        "reason": "Z-score within normal statistical boundaries", "sl": None, "tp": None,
-    }
-    
-    if long_cross:
-        vol = float(last_row["sigma"])
-        stop = float(current_row["Close"] - vol * cfg["STOP_MULT"])
-        risk = current_row["Close"] - stop
-        if risk > 0:
-            result.update({
-                "signal": "LONG", "sl": round(stop, 2),
-                "tp": round(float(current_row["Close"]) + risk * cfg["RR"], 2),
-                "reason": f"Z-Score positive momentum breakout ({last_row['Z']:.2f})"
-            })
-    elif short_cross:
-        vol = float(last_row["sigma"])
-        stop = float(current_row["Close"] + vol * cfg["STOP_MULT"])
-        risk = stop - current_row["Close"]
-        if risk > 0:
-            result.update({
-                "signal": "SHORT", "sl": round(stop, 2),
-                "tp": round(float(current_row["Close"]) - risk * cfg["RR"], 2),
-                "reason": f"Z-Score negative momentum breakout ({last_row['Z']:.2f})"
-            })
+    while True:
+        try:
+            # 1. Load active strategy from disk
+            strategy = load_active_strategy_from_disk()
+            if not strategy:
+                # No active strategy setup on disk yet
+                time.sleep(30)
+                continue
+                
+            timeframe = strategy.get("timeframe", "4h")
+            ind_config = strategy.get("indicators", {})
+            long_entry = strategy.get("long_entry_rules", [])
+            long_exit = strategy.get("long_exit_rules", [])
+            short_entry = strategy.get("short_entry_rules", [])
+            short_exit = strategy.get("short_exit_rules", [])
             
-    return result
-
-def _send_raw_email(subject, html):
-    """Low-level helper to send secure email. Supports Resend API and Gmail SMTP."""
-    cfg = ALERT_CONFIG
-    
-    # 1. Try Resend API first if configured (works on Render Free over HTTPS/port 443)
-    if cfg["RESEND_API_KEY"]:
-        try:
-            from_email = cfg["FROM_EMAIL"] or "onboarding@resend.dev"
-            headers = {
-                "Authorization": f"Bearer {cfg['RESEND_API_KEY']}",
-                "Content-Type": "application/json"
-            }
-            data = {
-                "from": from_email,
-                "to": [cfg["ALERT_EMAIL"]],
-                "subject": subject,
-                "html": html
-            }
-            res = requests.post("https://api.resend.com/emails", json=data, headers=headers, timeout=10)
-            if res.status_code in (200, 201):
-                _log.info(f"BG email sent via Resend API: {subject}")
-                return True
-            else:
-                _log.error(f"BG email send failed via Resend (Status {res.status_code}): {res.text}")
+            risk_pct = strategy.get("risk_pct", 1.5)
+            leverage = strategy.get("leverage", 3)
+            rr_ratio = strategy.get("rr_ratio", 3.0)
+            fee = strategy.get("fee", 0.04) / 100
+            slippage = strategy.get("slippage", 0.03) / 100
+            
+            stop_type = strategy.get("stop_loss_type", "ATR")
+            stop_val = strategy.get("stop_loss_val", 1.5)
+            tp_type = strategy.get("take_profit_type", "RR")
+            tp_val = strategy.get("take_profit_val", 3.0)
+            
+            # 2. Fetch live feed (candles)
+            df, fetch_err = data_loader.load_live_candles("BTCUSDT", timeframe, limit=200)
+            if fetch_err or df.empty:
+                state["errors"] += 1
+                save_alerter_state_to_disk(state)
+                time.sleep(60)
+                continue
+                
+            # 3. Compute indicators
+            df = indicators.compute_all_indicators(df, ind_config)
+            
+            # Index positions
+            idx_closed = len(df) - 2 # closed candle
+            current_price = float(df["Close"].iloc[-1]) # current tick price
+            
+            state["last_price"] = current_price
+            state["last_check"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            
+            cur_bar_time = df.index[-1].isoformat()
+            last_processed = state.get("last_processed_bar")
+            
+            active = state.get("active_trade")
+            
+            # 4. Check active position stop-outs
+            if active is not None:
+                exited = False
+                exit_price = current_price
+                exit_reason = ""
+                
+                if active["type"] == "LONG":
+                    if current_price <= active["sl"]:
+                        exited = True
+                        exit_price = active["sl"]
+                        exit_reason = "Stop Loss"
+                    elif current_price >= active["tp"]:
+                        exited = True
+                        exit_price = active["tp"]
+                        exit_reason = "Take Profit"
+                    elif long_exit and backtester.evaluate_ruleset(df, idx_closed, long_exit, "AND"):
+                        exited = True
+                        exit_price = current_price
+                        exit_reason = "Exit Rule"
+                        
+                elif active["type"] == "SHORT":
+                    if current_price >= active["sl"]:
+                        exited = True
+                        exit_price = active["sl"]
+                        exit_reason = "Stop Loss"
+                    elif current_price <= active["tp"]:
+                        exited = True
+                        exit_price = active["tp"]
+                        exit_reason = "Take Profit"
+                    elif short_exit and backtester.evaluate_ruleset(df, idx_closed, short_exit, "AND"):
+                        exited = True
+                        exit_price = current_price
+                        exit_reason = "Exit Rule"
+                        
+                if exited:
+                    # Close trade net of fees
+                    fee_cost = (active["size"] * active["entry_price"] * fee) + (active["size"] * exit_price * fee)
+                    if active["type"] == "LONG":
+                        gross_pnl = active["size"] * (exit_price - active["entry_price"])
+                    else:
+                        gross_pnl = active["size"] * (active["entry_price"] - exit_price)
+                    net_pnl = gross_pnl - fee_cost
+                    pnl_pct = (net_pnl / (active["size"] * active["entry_price"])) * 100
+                    
+                    log_entry = {
+                        "time": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+                        "signal": f"CLOSED {active['type']} ({exit_reason})",
+                        "price": f"${exit_price:,.2f}",
+                        "pnl": f"{pnl_pct:+.2f}% (${net_pnl:,.2f})"
+                    }
+                    state["log"] = ([log_entry] + state["log"])[:20]
+                        
+                    state["active_trade"] = None
+                    save_alerter_state_to_disk(state)
+                    
+            # 5. Check entry triggers on completed candle
+            if state["active_trade"] is None and (last_processed is None or cur_bar_time != last_processed):
+                long_trigger = backtester.evaluate_ruleset(df, idx_closed, long_entry, "AND")
+                short_trigger = backtester.evaluate_ruleset(df, idx_closed, short_entry, "AND")
+                
+                pos_type = None
+                if long_trigger and not short_trigger:
+                    pos_type = "LONG"
+                elif short_trigger and not long_trigger:
+                    pos_type = "SHORT"
+                    
+                if pos_type:
+                    # Open position
+                    entry_p = current_price * (1 + slippage) if pos_type == "LONG" else current_price * (1 - slippage)
+                    
+                    # Compute dynamic SL / TP
+                    atr_col = next((c for c in df.columns if c.startswith("ATR_")), None)
+                    if stop_type == "ATR":
+                        current_atr = df[atr_col].iloc[idx_closed] if (atr_col and atr_col in df.columns) else (df["Close"].rolling(14).std().iloc[idx_closed])
+                        if pd.isna(current_atr) or current_atr <= 0:
+                            current_atr = entry_p * 0.02
+                        sl_dist = float(stop_val) * current_atr
+                        sl = entry_p - sl_dist if pos_type == "LONG" else entry_p + sl_dist
+                    elif stop_type == "Percent":
+                        sl = entry_p * (1 - float(stop_val)/100) if pos_type == "LONG" else entry_p * (1 + float(stop_val)/100)
+                    else:
+                        sl = entry_p - float(stop_val) if pos_type == "LONG" else entry_p + float(stop_val)
+                        
+                    risk_dist = abs(entry_p - sl)
+                    if tp_type == "RR":
+                        tp = entry_p + (float(rr_ratio) * risk_dist) if pos_type == "LONG" else entry_p - (float(rr_ratio) * risk_dist)
+                    elif tp_type == "Percent":
+                        tp = entry_p * (1 + float(tp_val)/100) if pos_type == "LONG" else entry_p * (1 - float(tp_val)/100)
+                    else:
+                        tp = entry_p + float(tp_val) if pos_type == "LONG" else entry_p - float(tp_val)
+                        
+                    # Sizes based on mock 10k balance
+                    risk_dollars = 10000.0 * (risk_pct / 100)
+                    size = risk_dollars / risk_dist if risk_dist > 0 else 10000.0 / entry_p
+                    size = min(size, (10000.0 * leverage) / entry_p)
+                    
+                    new_trade = {
+                        "type": pos_type,
+                        "entry_price": entry_p,
+                        "sl": sl,
+                        "tp": tp,
+                        "size": size,
+                        "time": df.index[-1].strftime("%Y-%m-%d %H:%M UTC")
+                    }
+                    state["active_trade"] = new_trade
+                    state["last_signal"] = pos_type
+                    state["last_signal_time"] = df.index[-1]
+                    
+                    log_entry = {
+                        "time": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+                        "signal": f"OPENED {pos_type}",
+                        "price": f"${entry_p:,.2f}",
+                        "pnl": "OPEN"
+                    }
+                    state["log"] = ([log_entry] + state["log"])[:20]
+                        
+                    save_alerter_state_to_disk(state)
+                    
+                state["last_processed_bar"] = cur_bar_time
+                save_alerter_state_to_disk(state)
+                
         except Exception as e:
-            _log.error(f"BG email send error via Resend API: {e}")
-
-    # 2. Try Gmail SMTP if credentials are set
-    if cfg["SMTP_USER"] and cfg["SMTP_PASS"]:
-        try:
-            msg = MIMEMultipart("alternative")
-            msg["Subject"] = subject
-            msg["From"]    = cfg["SMTP_USER"]
-            msg["To"]      = cfg["ALERT_EMAIL"]
-            msg.attach(MIMEText(html, "html"))
-            ctx = ssl.create_default_context()
-            with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ctx) as server:
-                server.login(cfg["SMTP_USER"], cfg["SMTP_PASS"])
-                server.sendmail(cfg["SMTP_USER"], cfg["ALERT_EMAIL"], msg.as_string())
-            _log.info(f"BG email sent via SMTP: {subject}")
-            return True
-        except Exception as e:
-            _log.error(f"BG email send failed via SMTP: {e}")
-            return False
-
-    _log.error("BG email send failed: No valid credentials set (SMTP or Resend API key)")
-    return False
-
-def _bg_send_new_trade_email(active_trade):
-    """Send alert email when a new trade is opened."""
-    cfg = ALERT_CONFIG
-    if not (cfg["RESEND_API_KEY"] or (cfg["SMTP_USER"] and cfg["SMTP_PASS"])) or not cfg["ALERT_EMAIL"]:
-        _log.error("BG new trade email failed: credentials not set")
-        return False
-    direction = active_trade["type"]
-    color     = "#00ff88" if direction == "LONG" else "#ff3366"
-    arrow     = "▲ LONG"  if direction == "LONG" else "▼ SHORT"
-    entry     = active_trade["entry_price"]
-    sl        = active_trade["sl"]
-    tp        = active_trade["tp"]
-    sl_pct    = abs(entry - sl) / entry * 100
-    tp_pct    = abs(tp - entry) / entry * 100
-    ts        = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    subject   = f"[BTC Algo] 🚀 NEW TRADE OPENED: {direction} — ${entry:,.2f}"
-    html = f"""
-    <html><body style="background:#020408;color:#e8f4ff;font-family:Arial,sans-serif;padding:24px;">
-      <div style="max-width:540px;margin:auto;background:#071020;border:2px solid {color};border-radius:12px;padding:28px;">
-        <div style="font-size:28px;font-weight:700;color:{color};margin-bottom:4px;">🚀 {arrow} OPENED</div>
-        <div style="font-size:12px;color:#7aa0c0;margin-bottom:24px;">BTC/USDT · 4H Timeframe · {ts}</div>
-        <table style="width:100%;border-collapse:collapse;font-size:15px;">
-          <tr style="border-bottom:1px solid rgba(255,255,255,0.06);">
-            <td style="padding:10px 0;color:#7aa0c0;">Entry Price</td>
-            <td style="padding:10px 0;color:{color};font-weight:700;font-size:22px;text-align:right;">${entry:,.2f}</td>
-          </tr>
-          <tr style="border-bottom:1px solid rgba(255,255,255,0.06);">
-            <td style="padding:10px 0;color:#7aa0c0;">Stop Loss</td>
-            <td style="padding:10px 0;color:#ff3366;font-weight:600;text-align:right;">${sl:,.2f} <span style="font-size:11px;color:#7aa0c0;">({sl_pct:.2f}% risk)</span></td>
-          </tr>
-          <tr style="border-bottom:1px solid rgba(255,255,255,0.06);">
-            <td style="padding:10px 0;color:#7aa0c0;">Take Profit</td>
-            <td style="padding:10px 0;color:#00ff88;font-weight:600;text-align:right;">${tp:,.2f} <span style="font-size:11px;color:#7aa0c0;">(+{tp_pct:.2f}%)</span></td>
-          </tr>
-        </table>
-        <div style="margin-top:22px;padding:12px 16px;background:rgba(255,140,0,0.07);border-left:3px solid #ff8c00;border-radius:4px;font-size:11px;color:#7aa0c0;line-height:1.7;">
-          ⚠️ Automated trade alert. Always apply proper risk controls.
-        </div>
-      </div>
-    </body></html>"""
-    return _send_raw_email(subject, html)
-
-def _bg_send_active_trade_status_email(active_trade, current_price):
-    """Send a status report email for an currently active trade."""
-    cfg = ALERT_CONFIG
-    if not (cfg["RESEND_API_KEY"] or (cfg["SMTP_USER"] and cfg["SMTP_PASS"])) or not cfg["ALERT_EMAIL"]:
-        _log.error("BG trade status email failed: credentials not set")
-        return False
-    direction = active_trade["type"]
-    entry     = active_trade["entry_price"]
-    sl        = active_trade["sl"]
-    tp        = active_trade["tp"]
-    
-    if direction == "LONG":
-        pnl_pct = (current_price - entry) / entry * 100
-    else:
-        pnl_pct = (entry - current_price) / entry * 100
-        
-    pnl_color = "#00ff88" if pnl_pct >= 0 else "#ff3366"
-    pnl_sign  = "+" if pnl_pct >= 0 else ""
-    
-    dist_to_sl = abs(current_price - sl) / current_price * 100
-    dist_to_tp = abs(tp - current_price) / current_price * 100
-    
-    ts        = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    subject   = f"[BTC Algo] 📊 ACTIVE TRADE UPDATE: {direction} ({pnl_sign}{pnl_pct:.2f}%)"
-    
-    html = f"""
-    <html><body style="background:#020408;color:#e8f4ff;font-family:Arial,sans-serif;padding:24px;">
-      <div style="max-width:540px;margin:auto;background:#071020;border:1px solid #00dcff55;border-radius:12px;padding:28px;">
-        <div style="font-size:26px;font-weight:700;color:#00dcff;margin-bottom:4px;">📊 ACTIVE TRADE UPDATE</div>
-        <div style="font-size:12px;color:#7aa0c0;margin-bottom:24px;">BTC/USDT · 4H Interval Report · {ts}</div>
-        
-        <div style="margin-bottom:20px;padding:12px 16px;background:{pnl_color}10;border-left:3px solid {pnl_color};border-radius:4px;font-size:15px;color:#e8f4ff;">
-          <b>Current PnL:</b> <span style="color:{pnl_color};font-weight:700;">{pnl_sign}{pnl_pct:.2f}%</span>
-        </div>
-
-        <table style="width:100%;border-collapse:collapse;font-size:15px;">
-          <tr style="border-bottom:1px solid rgba(255,255,255,0.06);">
-            <td style="padding:10px 0;color:#7aa0c0;">Position Direction</td>
-            <td style="padding:10px 0;color:#e8f4ff;font-weight:700;text-align:right;">{direction}</td>
-          </tr>
-          <tr style="border-bottom:1px solid rgba(255,255,255,0.06);">
-            <td style="padding:10px 0;color:#7aa0c0;">Entry Price</td>
-            <td style="padding:10px 0;color:#e8f4ff;text-align:right;">${entry:,.2f}</td>
-          </tr>
-          <tr style="border-bottom:1px solid rgba(255,255,255,0.06);">
-            <td style="padding:10px 0;color:#7aa0c0;">Current Price</td>
-            <td style="padding:10px 0;color:#00dcff;font-weight:700;text-align:right;">${current_price:,.2f}</td>
-          </tr>
-          <tr style="border-bottom:1px solid rgba(255,255,255,0.06);">
-            <td style="padding:10px 0;color:#7aa0c0;">Stop Loss</td>
-            <td style="padding:10px 0;color:#ff3366;text-align:right;">${sl:,.2f} <span style="font-size:11px;color:#7aa0c0;">({dist_to_sl:.2f}% away)</span></td>
-          </tr>
-          <tr>
-            <td style="padding:10px 0;color:#7aa0c0;">Take Profit</td>
-            <td style="padding:10px 0;color:#00ff88;text-align:right;">${tp:,.2f} <span style="font-size:11px;color:#7aa0c0;">({dist_to_tp:.2f}% away)</span></td>
-          </tr>
-        </table>
-      </div>
-    </body></html>"""
-    return _send_raw_email(subject, html)
-
-def _bg_send_no_trade_status_email(sig):
-    """Send an update when there are no active trades."""
-    cfg = ALERT_CONFIG
-    if not (cfg["RESEND_API_KEY"] or (cfg["SMTP_USER"] and cfg["SMTP_PASS"])) or not cfg["ALERT_EMAIL"]:
-        _log.error("BG flat status email failed: credentials not set")
-        return False
-    ts        = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    subject   = f"[BTC Algo] 💤 FLAT STATUS UPDATE: No Active Trades"
-    html = f"""
-    <html><body style="background:#020408;color:#e8f4ff;font-family:Arial,sans-serif;padding:24px;">
-      <div style="max-width:540px;margin:auto;background:#071020;border:1px solid #3a5a78;border-radius:12px;padding:28px;">
-        <div style="font-size:26px;font-weight:700;color:#7aa0c0;margin-bottom:4px;">💤 FLAT STATUS UPDATE</div>
-        <div style="font-size:12px;color:#3a5a78;margin-bottom:24px;">BTC/USDT · 4H Interval Report · {ts}</div>
-        
-        <div style="margin-bottom:20px;padding:12px 16px;background:rgba(58,90,120,0.1);border-left:3px solid #3a5a78;border-radius:4px;font-size:14px;color:#7aa0c0;">
-          <b>Current Status:</b> No active trades or new signals. The algorithm is waiting for strategy conditions to align.
-        </div>
-
-        <table style="width:100%;border-collapse:collapse;font-size:15px;">
-          <tr style="border-bottom:1px solid rgba(255,255,255,0.06);">
-            <td style="padding:10px 0;color:#7aa0c0;">Current BTC Price</td>
-            <td style="padding:10px 0;color:#e8f4ff;font-weight:700;text-align:right;">${sig.get('price', 0.0):,.2f}</td>
-          </tr>
-          <tr style="border-bottom:1px solid rgba(255,255,255,0.06);">
-            <td style="padding:10px 0;color:#7aa0c0;">Rolling Price Mean</td>
-            <td style="padding:10px 0;color:#e8f4ff;text-align:right;">${sig.get('mu', 0.0):,.2f}</td>
-          </tr>
-          <tr style="border-bottom:1px solid rgba(255,255,255,0.06);">
-            <td style="padding:10px 0;color:#7aa0c0;">Standard Deviation</td>
-            <td style="padding:10px 0;color:#e8f4ff;text-align:right;">${sig.get('sigma', 0.0):,.2f}</td>
-          </tr>
-          <tr>
-            <td style="padding:10px 0;color:#7aa0c0;">Market State</td>
-            <td style="padding:10px 0;color:#00dcff;text-align:right;">{sig.get('reason', 'Searching for setup')}</td>
-          </tr>
-        </table>
-      </div>
-    </body></html>"""
-    return _send_raw_email(subject, html)
-
-def _bg_send_trade_closed_email(closed_trade, exit_price, result_type):
-    """Send an alert when a trade is hit at Stop Loss or Take Profit."""
-    cfg = ALERT_CONFIG
-    if not (cfg["RESEND_API_KEY"] or (cfg["SMTP_USER"] and cfg["SMTP_PASS"])) or not cfg["ALERT_EMAIL"]:
-        _log.error("BG trade closed email failed: credentials not set")
-        return False
-    direction = closed_trade["type"]
-    entry     = closed_trade["entry_price"]
-    
-    if direction == "LONG":
-        pnl_pct = (exit_price - entry) / entry * 100
-    else:
-        pnl_pct = (entry - exit_price) / entry * 100
-        
-    color     = "#00ff88" if result_type == "WIN" else "#ff3366"
-    ts        = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    subject   = f"[BTC Algo] 🎯 TRADE CLOSED: {result_type} — {pnl_pct:+.2f}%"
-    
-    html = f"""
-    <html><body style="background:#020408;color:#e8f4ff;font-family:Arial,sans-serif;padding:24px;">
-      <div style="max-width:540px;margin:auto;background:#071020;border:2px solid {color};border-radius:12px;padding:28px;">
-        <div style="font-size:28px;font-weight:700;color:{color};margin-bottom:4px;">🎯 POSITION CLOSED: {result_type}</div>
-        <div style="font-size:12px;color:#7aa0c0;margin-bottom:24px;">BTC/USDT · 4H Timeframe · {ts}</div>
-        <table style="width:100%;border-collapse:collapse;font-size:15px;">
-          <tr style="border-bottom:1px solid rgba(255,255,255,0.06);">
-            <td style="padding:10px 0;color:#7aa0c0;">Position Side</td>
-            <td style="padding:10px 0;color:#e8f4ff;font-weight:700;text-align:right;">{direction}</td>
-          </tr>
-          <tr style="border-bottom:1px solid rgba(255,255,255,0.06);">
-            <td style="padding:10px 0;color:#7aa0c0;">Entry Price</td>
-            <td style="padding:10px 0;color:#7aa0c0;text-align:right;">${entry:,.2f}</td>
-          </tr>
-          <tr style="border-bottom:1px solid rgba(255,255,255,0.06);">
-            <td style="padding:10px 0;color:#7aa0c0;">Exit Price</td>
-            <td style="padding:10px 0;color:{color};font-weight:700;text-align:right;">${exit_price:,.2f}</td>
-          </tr>
-          <tr>
-            <td style="padding:10px 0;color:#7aa0c0;">Realized PnL</td>
-            <td style="padding:10px 0;color:{color};font-weight:700;font-size:20px;text-align:right;">{pnl_pct:+.2f}%</td>
-          </tr>
-        </table>
-      </div>
-    </body></html>"""
-    return _send_raw_email(subject, html)
+            logger.error(f"Error in BG Alerter Loop: {e}")
+            state["errors"] += 1
+            save_alerter_state_to_disk(state)
+            
+        time.sleep(60)
 
 @st.cache_resource
 def start_background_alerter():
-    """
-    Starts a single background daemon thread that checks for signals every
-    30 minutes and sends reports.
-    """
     state = _get_alerter_state()
     if state["running"]:
-        return state   # already started
-
-    def _loop():
-        state["running"] = True
-        _log.info("▶ Background alerter thread started.")
-        while True:
-            try:
-                df = _bg_fetch_candles()
-                if df is not None and not df.empty:
-                    cur_bar_time = df.index[-1].isoformat()
-                    last_processed = state.get("last_processed_bar")
-                    
-                    state["last_check"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-                    last_price = float(df["Close"].iloc[-1])
-                    state["last_price"] = last_price
-                    
-                    # 1. Check if we have an active trade and see if it hit SL/TP at any time
-                    active = state["active_trade"]
-                    if active is not None:
-                        hit_sl = False
-                        hit_tp = False
-                        if active["type"] == "LONG":
-                            if last_price <= active["sl"]:
-                                hit_sl = True
-                            elif last_price >= active["tp"]:
-                                hit_tp = True
-                        elif active["type"] == "SHORT":
-                            if last_price >= active["sl"]:
-                                hit_sl = True
-                            elif last_price <= active["tp"]:
-                                hit_tp = True
-                                
-                        if hit_sl or hit_tp:
-                            result_type = "WIN" if hit_tp else "LOSS"
-                            exit_p = active["tp"] if hit_tp else active["sl"]
-                            ok = _bg_send_trade_closed_email(active, exit_p, result_type)
-                            
-                            # Log the trade closing
-                            entry = {
-                                "time":   datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-                                "signal": f"CLOSED {result_type}",
-                                "price":  f"${exit_p:,.2f}",
-                                "sl":     f"${active['sl']:,.2f}",
-                                "tp":     f"${active['tp']:,.2f}",
-                                "email":  "✅ Sent" if ok else "❌ Failed",
-                            }
-                            state["log"] = ([entry] + state["log"])[:20]
-                            if ok:
-                                state["emails_sent"] += 1
-                            else:
-                                state["errors"] += 1
-                            
-                            state["active_trade"] = None
-                            active = None # Reset local variable for next checks
-                            
-                    # 2. Check if a new 4H candle has closed
-                    if last_processed is None or cur_bar_time != last_processed:
-                        # Process 4-hour interval update
-                        if active is not None:
-                            # We have an active trade, send its status update
-                            ok = _bg_send_active_trade_status_email(active, last_price)
-                            if ok:
-                                state["emails_sent"] += 1
-                            else:
-                                state["errors"] += 1
-                        else:
-                            # We don't have an active trade, run strategy checks for new entries
-                            sig = _bg_compute_signal(df)
-                            state["last_signal"] = sig["signal"]
-                            
-                            if sig["signal"] in ("LONG", "SHORT"):
-                                # Open a new trade!
-                                new_trade = {
-                                    "type": sig["signal"],
-                                    "entry_price": sig["price"],
-                                    "sl": sig["sl"],
-                                    "tp": sig["tp"],
-                                    "time": sig["time"].isoformat() if hasattr(sig["time"], "isoformat") else str(sig["time"]),
-                                }
-                                state["active_trade"] = new_trade
-                                ok = _bg_send_new_trade_email(new_trade)
-                                
-                                entry = {
-                                    "time":   sig["time"].strftime("%Y-%m-%d %H:%M UTC") if hasattr(sig["time"], "strftime") else str(sig["time"]),
-                                    "signal": sig["signal"],
-                                    "price":  f"${sig['price']:,.2f}",
-                                    "sl":     f"${sig['sl']:,.2f}",
-                                    "tp":     f"${sig['tp']:,.2f}",
-                                    "email":  "✅ Sent" if ok else "❌ Failed",
-                                }
-                                state["log"] = ([entry] + state["log"])[:20]
-                                if ok:
-                                    state["emails_sent"] += 1
-                                    state["last_signal_time"] = sig["time"]
-                                else:
-                                    state["errors"] += 1
-                            else:
-                                # FLAT status: send Flat/No trades status update email
-                                ok = _bg_send_no_trade_status_email(sig)
-                                if ok:
-                                    state["emails_sent"] += 1
-                                else:
-                                    state["errors"] += 1
-                        
-                        state["last_processed_bar"] = cur_bar_time
-            except Exception as e:
-                state["errors"] += 1
-                _log.error(f"BG alerter loop error: {e}")
-
-            time.sleep(ALERT_CONFIG["CHECK_EVERY_SECONDS"])
-
-    t = threading.Thread(target=_loop, daemon=True, name="btc_bg_alerter")
+        return state
+    t = threading.Thread(target=background_alerter_loop, daemon=True, name="btc_bg_alerter")
     t.start()
     return state
 
 # ─────────────────────────────────────────────────────
-#  PAGE CONFIG
+# Streamlit Page Config
 # ─────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="BTC Algo Trader Pro",
+    page_title="BTC Custom Backtesting Terminal",
     page_icon="₿",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="expanded"
 )
 
-# Auto-refresh every 60 seconds — keeps the page alive and pulls fresh signals
+# Auto-refresh UI every 60s
 _refresh_count = st_autorefresh(interval=60_000, limit=None, key="live_refresh")
 
+# Initialize alerter process
+_alerter_state = start_background_alerter()
+
 # ─────────────────────────────────────────────────────
-#  GLOBAL CSS — Premium Cyber-Finance Theme
+# Theme styling (Premium glowing dark cyber theme)
 # ─────────────────────────────────────────────────────
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Rajdhani:wght@300;400;500;600;700&family=JetBrains+Mono:wght@300;400;500;700&family=Oxanium:wght@300;400;600;700;800&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Rajdhani:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&family=Outfit:wght@400;600;800&display=swap');
 
-/* ── ROOT VARS ── */
 :root {
   --bg-void:      #020408;
   --bg-deep:      #040c14;
@@ -519,569 +327,185 @@ st.markdown("""
   --border-glow:  rgba(0,220,255,0.35);
   --cyan:         #00dcff;
   --cyan-dim:     rgba(0,220,255,0.15);
-  --cyan-glow:    rgba(0,220,255,0.4);
   --green:        #00ff88;
-  --green-dim:    rgba(0,255,136,0.12);
   --red:          #ff3366;
-  --red-dim:      rgba(255,51,102,0.12);
   --orange:       #ff8c00;
-  --orange-dim:   rgba(255,140,0,0.15);
   --purple:       #b24bff;
-  --purple-dim:   rgba(178,75,255,0.12);
   --text-bright:  #e8f4ff;
   --text-mid:     #7aa0c0;
   --text-dim:     #3a5a78;
-  --font-display: 'Oxanium', monospace;
+  --font-display: 'Outfit', sans-serif;
   --font-body:    'Rajdhani', sans-serif;
   --font-mono:    'JetBrains Mono', monospace;
 }
 
-/* ── BASE RESET ── */
 html, body, [class*="css"] {
   font-family: var(--font-body);
   font-size: 15px;
   color: var(--text-bright);
 }
 
-/* ── SCROLLBAR ── */
-::-webkit-scrollbar { width: 4px; height: 4px; }
-::-webkit-scrollbar-track { background: var(--bg-void); }
-::-webkit-scrollbar-thumb { background: var(--cyan-dim); border-radius: 2px; }
-
-/* ── APP BACKGROUND with animated grid ── */
 .stApp {
   background: var(--bg-void);
   background-image:
-    linear-gradient(rgba(0,220,255,0.03) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(0,220,255,0.03) 1px, transparent 1px);
+    linear-gradient(rgba(0,220,255,0.02) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0,220,255,0.02) 1px, transparent 1px);
   background-size: 40px 40px;
-  background-position: center center;
-}
-.stApp::before {
-  content: '';
-  position: fixed;
-  inset: 0;
-  background:
-    radial-gradient(ellipse 60% 40% at 20% 20%, rgba(0,100,220,0.08) 0%, transparent 60%),
-    radial-gradient(ellipse 50% 30% at 80% 80%, rgba(0,60,180,0.06) 0%, transparent 60%),
-    radial-gradient(ellipse 30% 20% at 50% 10%, rgba(0,220,255,0.04) 0%, transparent 50%);
-  pointer-events: none;
-  z-index: 0;
 }
 
-/* ── SIDEBAR ── */
 [data-testid="stSidebar"] {
   background: var(--bg-deep) !important;
   border-right: 1px solid var(--border-dim) !important;
 }
-[data-testid="stSidebar"]::before {
-  content: '';
-  position: absolute;
-  top: 0; right: 0; bottom: 0;
-  width: 1px;
-  background: linear-gradient(180deg, transparent, var(--cyan), rgba(0,220,255,0.3), transparent);
-  animation: lineflow 4s linear infinite;
-}
-[data-testid="stSidebar"] .stMarkdown h3 {
-  color: var(--cyan) !important;
-  font-family: var(--font-display) !important;
-  font-size: 11px !important;
-  letter-spacing: 2px !important;
-  text-transform: uppercase !important;
-  font-weight: 600 !important;
-  opacity: 0.9;
-}
-[data-testid="stSidebar"] label {
-  color: var(--text-mid) !important;
-  font-size: 12px !important;
-  font-family: var(--font-body) !important;
-  letter-spacing: 0.5px;
-}
-[data-testid="stSidebar"] .stSlider [data-baseweb="slider"] {
-  margin-top: 4px;
-}
 
-/* ── SLIDER THUMB ── */
-[data-testid="stSlider"] [data-baseweb="slider"] [role="slider"] {
-  background: var(--cyan) !important;
-  box-shadow: 0 0 12px var(--cyan-glow) !important;
-  border: none !important;
-}
-[data-testid="stSlider"] [data-baseweb="slider"] > div > div > div:first-child {
-  background: linear-gradient(90deg, var(--cyan-dim), var(--cyan)) !important;
-}
-
-/* ── TOGGLE ── */
-[data-testid="stToggle"] > label > div {
-  background-color: var(--bg-panel) !important;
-  border: 1px solid var(--border-dim) !important;
-}
-[data-testid="stToggle"] > label > div[data-checked="true"] {
-  background-color: var(--cyan-dim) !important;
-  border-color: var(--cyan) !important;
-}
-
-/* ── BUTTONS ── */
-.stButton > button {
-  background: transparent !important;
-  color: var(--cyan) !important;
-  font-family: var(--font-display) !important;
-  font-weight: 700 !important;
-  font-size: 13px !important;
-  letter-spacing: 2px !important;
-  text-transform: uppercase !important;
-  border: 1px solid var(--border-glow) !important;
-  border-radius: 6px !important;
-  padding: 10px 24px !important;
-  position: relative;
-  overflow: hidden;
-  transition: all 0.3s ease !important;
-  box-shadow: 0 0 20px rgba(0,220,255,0.1), inset 0 0 20px rgba(0,220,255,0.03) !important;
-}
-.stButton > button::before {
-  content: '';
-  position: absolute;
-  top: 0; left: -100%;
-  width: 100%; height: 100%;
-  background: linear-gradient(90deg, transparent, rgba(0,220,255,0.15), transparent);
-  transition: left 0.4s;
-}
-.stButton > button:hover {
-  background: rgba(0,220,255,0.08) !important;
-  box-shadow: 0 0 30px rgba(0,220,255,0.3), inset 0 0 30px rgba(0,220,255,0.05) !important;
-  border-color: var(--cyan) !important;
-  transform: translateY(-2px) !important;
-}
-.stButton > button:hover::before { left: 100%; }
-
-/* ── TABS ── */
-.stTabs [data-baseweb="tab-list"] {
-  background: var(--bg-deep) !important;
-  border-bottom: 1px solid var(--border-dim) !important;
-  gap: 2px !important;
-  padding: 4px 4px 0 !important;
-}
-.stTabs [data-baseweb="tab"] {
-  background: transparent !important;
-  color: var(--text-dim) !important;
-  font-family: var(--font-display) !important;
-  font-size: 12px !important;
-  font-weight: 600 !important;
-  letter-spacing: 1.5px !important;
-  text-transform: uppercase !important;
-  padding: 10px 18px !important;
-  border-radius: 6px 6px 0 0 !important;
-  transition: all 0.2s !important;
-}
-.stTabs [data-baseweb="tab"]:hover {
-  color: var(--cyan) !important;
-  background: rgba(0,220,255,0.04) !important;
-}
-.stTabs [aria-selected="true"] {
-  background: var(--bg-panel) !important;
-  color: var(--cyan) !important;
-  border-bottom: 2px solid var(--cyan) !important;
-  text-shadow: 0 0 12px var(--cyan-glow) !important;
-}
-
-/* ── INPUTS ── */
-.stSelectbox [data-baseweb="select"],
-.stMultiSelect [data-baseweb="select"] {
-  background: var(--bg-panel) !important;
-  border: 1px solid var(--border-dim) !important;
-  border-radius: 6px !important;
-}
-.stNumberInput input, .stTextInput input {
-  background: var(--bg-panel) !important;
-  color: var(--text-bright) !important;
-  border: 1px solid var(--border-dim) !important;
-  border-radius: 6px !important;
-  font-family: var(--font-mono) !important;
-}
-input[type="date"] {
-  background: var(--bg-panel) !important;
-  color: var(--text-bright) !important;
-  border: 1px solid var(--border-dim) !important;
-  border-radius: 6px !important;
-  font-family: var(--font-mono) !important;
-}
-
-/* ── DATAFRAME ── */
-.stDataFrame {
-  border: 1px solid var(--border-dim) !important;
-  border-radius: 8px !important;
-  overflow: hidden !important;
-}
-.stDataFrame thead th {
-  background: var(--bg-panel) !important;
-  color: var(--cyan) !important;
-  font-family: var(--font-display) !important;
-  letter-spacing: 1px !important;
-  font-size: 11px !important;
-}
-
-/* ── EXPANDER ── */
-.streamlit-expanderHeader {
-  background: var(--bg-panel) !important;
-  color: var(--text-bright) !important;
-  border-radius: 8px !important;
-  border: 1px solid var(--border-dim) !important;
-  font-family: var(--font-display) !important;
-}
-
-/* ─── METRIC CARD ─── */
+/* Custom Metric Card formatting */
 .metric-card {
   background: var(--bg-glass);
-  backdrop-filter: blur(20px);
-  -webkit-backdrop-filter: blur(20px);
+  backdrop-filter: blur(15px);
+  -webkit-backdrop-filter: blur(15px);
   border: 1px solid var(--border-dim);
   border-radius: 12px;
-  padding: 20px 18px 16px;
+  padding: 18px 16px 14px;
   text-align: center;
   position: relative;
   overflow: hidden;
   transition: all 0.3s ease;
-  cursor: default;
+  margin-bottom: 12px;
 }
 .metric-card::before {
   content: '';
   position: absolute;
   top: 0; left: 0; right: 0;
-  height: 2px;
+  height: 2.5px;
   background: var(--accent-grad, linear-gradient(90deg, var(--cyan), var(--purple)));
-  box-shadow: 0 0 8px var(--accent-color, var(--cyan));
-}
-.metric-card::after {
-  content: '';
-  position: absolute;
-  inset: 0;
-  background: radial-gradient(ellipse 80% 60% at 50% 0%, var(--accent-dim, rgba(0,220,255,0.05)), transparent);
-  pointer-events: none;
 }
 .metric-card:hover {
   border-color: var(--border-glow);
-  transform: translateY(-3px);
-  box-shadow: 0 8px 32px rgba(0,0,0,0.4), 0 0 20px var(--accent-dim, rgba(0,220,255,0.1));
+  transform: translateY(-2px);
+  box-shadow: 0 8px 24px rgba(0,0,0,0.5), 0 0 15px rgba(0,220,255,0.1);
 }
 .metric-label {
   font-family: var(--font-display);
   font-size: 10px;
   font-weight: 600;
-  letter-spacing: 2px;
+  letter-spacing: 1.5px;
   text-transform: uppercase;
   color: var(--text-dim);
-  margin-bottom: 10px;
+  margin-bottom: 8px;
 }
 .metric-value {
   font-family: var(--font-display);
-  font-size: 28px;
+  font-size: 24px;
   font-weight: 800;
   color: var(--text-bright);
-  line-height: 1;
-  letter-spacing: 1px;
 }
 .metric-sub {
   font-family: var(--font-mono);
   font-size: 10px;
   color: var(--text-dim);
-  margin-top: 8px;
-  letter-spacing: 0.5px;
+  margin-top: 6px;
 }
-.positive { color: var(--green) !important; text-shadow: 0 0 10px rgba(0,255,136,0.4); }
-.negative { color: var(--red)   !important; text-shadow: 0 0 10px rgba(255,51,102,0.4); }
-.neutral  { color: var(--cyan)  !important; text-shadow: 0 0 10px rgba(0,220,255,0.4); }
-.warm     { color: var(--orange)!important; text-shadow: 0 0 10px rgba(255,140,0,0.4); }
 
-/* ─── SECTION HEADER ─── */
+.positive { color: var(--green) !important; }
+.negative { color: var(--red) !important; }
+.neutral { color: var(--cyan) !important; }
+.warm { color: var(--orange) !important; }
+
+/* Section Header formatting */
 .section-header {
   display: flex;
   align-items: center;
-  gap: 12px;
-  position: relative;
-  margin: 28px 0 16px;
-  padding: 12px 20px;
-  background: linear-gradient(90deg, rgba(0,220,255,0.06) 0%, transparent 100%);
-  border-left: 2px solid var(--cyan);
-  border-radius: 0 8px 8px 0;
-}
-.section-header::after {
-  content: '';
-  position: absolute;
-  bottom: 0; left: 0; right: 0;
-  height: 1px;
-  background: linear-gradient(90deg, var(--border-glow), transparent);
+  gap: 10px;
+  margin: 20px 0 12px;
+  padding: 10px 16px;
+  background: linear-gradient(90deg, rgba(0,220,255,0.05) 0%, transparent 100%);
+  border-left: 3px solid var(--cyan);
+  border-radius: 0 6px 6px 0;
 }
 .section-header h3 {
   margin: 0;
   font-family: var(--font-display);
   font-size: 14px;
   font-weight: 700;
-  letter-spacing: 2px;
+  letter-spacing: 1.5px;
   text-transform: uppercase;
   color: var(--text-bright);
 }
-.section-header .icon {
-  font-size: 18px;
-  filter: drop-shadow(0 0 6px var(--cyan));
-}
 
-/* ─── HERO BANNER ─── */
-.hero-banner {
-  position: relative;
-  background: var(--bg-glass);
-  backdrop-filter: blur(30px);
-  border: 1px solid var(--border-dim);
-  border-radius: 16px;
-  padding: 28px 36px;
-  margin-bottom: 28px;
-  overflow: hidden;
-}
-.hero-banner::before {
-  content: '';
-  position: absolute;
-  top: -50%; left: -20%;
-  width: 60%; height: 200%;
-  background: radial-gradient(ellipse, rgba(0,220,255,0.06), transparent 70%);
-  pointer-events: none;
-}
-.hero-banner::after {
-  content: '';
-  position: absolute;
-  top: 0; right: 0; bottom: 0;
-  width: 300px;
-  background: radial-gradient(ellipse at right, rgba(0,100,255,0.04), transparent);
-  pointer-events: none;
-}
-.hero-title {
-  font-family: var(--font-display);
-  font-size: 30px;
-  font-weight: 800;
-  letter-spacing: 3px;
-  text-transform: uppercase;
-  background: linear-gradient(135deg, var(--cyan), var(--green) 60%, var(--cyan));
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  background-clip: text;
-  line-height: 1.1;
-  margin-bottom: 6px;
-}
-.hero-sub {
-  font-family: var(--font-mono);
-  font-size: 11px;
-  color: var(--text-dim);
-  letter-spacing: 1.5px;
-  text-transform: uppercase;
-}
-.hero-stat-label {
-  font-family: var(--font-display);
-  font-size: 9px;
-  letter-spacing: 2px;
-  text-transform: uppercase;
-  color: var(--text-dim);
-}
-.hero-stat-value {
-  font-family: var(--font-display);
-  font-size: 15px;
-  font-weight: 700;
-  color: var(--cyan);
-  letter-spacing: 1px;
-}
-.hero-badge {
-  display: inline-block;
-  background: rgba(0,220,255,0.08);
-  border: 1px solid rgba(0,220,255,0.2);
-  border-radius: 4px;
-  padding: 3px 10px;
-  font-family: var(--font-mono);
-  font-size: 10px;
-  color: var(--cyan);
-  letter-spacing: 1px;
-  margin-top: 8px;
-}
-
-/* ─── INFO BOX ─── */
 .info-box {
-  background: rgba(0,220,255,0.04);
+  background: rgba(0,220,255,0.03);
   border: 1px solid var(--border-dim);
-  border-left: 2px solid rgba(0,220,255,0.3);
-  border-radius: 8px;
-  padding: 14px 18px;
+  border-left: 3px solid rgba(0,220,255,0.25);
+  border-radius: 6px;
+  padding: 12px 16px;
   margin: 10px 0;
   font-family: var(--font-mono);
   font-size: 12px;
   color: var(--text-mid);
-  line-height: 1.8;
+  line-height: 1.7;
 }
-.info-box b { color: var(--cyan); font-weight: 600; }
+.info-box b { color: var(--cyan); }
 
-/* ─── SIDEBAR LOGO ─── */
-.sidebar-logo {
-  text-align: center;
-  padding: 20px 0 28px;
-}
-.sidebar-logo .btc-symbol {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 64px; height: 64px;
-  background: radial-gradient(circle, rgba(0,220,255,0.15), transparent);
-  border: 1px solid rgba(0,220,255,0.3);
-  border-radius: 50%;
-  font-size: 32px;
-  margin-bottom: 10px;
-  box-shadow: 0 0 20px rgba(0,220,255,0.2), inset 0 0 20px rgba(0,220,255,0.05);
-  animation: pulse-glow 3s ease-in-out infinite;
-}
-.sidebar-logo .app-name {
-  font-family: var(--font-display);
-  font-size: 16px;
-  font-weight: 800;
-  letter-spacing: 3px;
-  text-transform: uppercase;
-  color: var(--text-bright);
-}
-.sidebar-logo .app-sub {
+.rule-badge {
+  display: inline-block;
+  padding: 4px 8px;
+  background: rgba(178,75,255,0.08);
+  border: 1px solid rgba(178,75,255,0.25);
+  border-radius: 4px;
   font-family: var(--font-mono);
-  font-size: 9px;
-  color: var(--text-dim);
-  letter-spacing: 2px;
-  text-transform: uppercase;
-  margin-top: 3px;
+  font-size: 11px;
+  color: #c98eff;
+  margin-right: 6px;
+  margin-bottom: 6px;
 }
 
-/* ─── DIVIDER ─── */
 .cyber-divider {
   height: 1px;
   background: linear-gradient(90deg, transparent, var(--border-glow), transparent);
-  margin: 20px 0;
+  margin: 18px 0;
 }
 
-/* ─── ANIMATIONS ─── */
-@keyframes pulse-glow {
-  0%, 100% { box-shadow: 0 0 20px rgba(0,220,255,0.2), inset 0 0 20px rgba(0,220,255,0.05); }
-  50%       { box-shadow: 0 0 35px rgba(0,220,255,0.4), inset 0 0 30px rgba(0,220,255,0.08); }
-}
-@keyframes lineflow {
-  0%   { opacity: 0; transform: translateY(-100%); }
-  50%  { opacity: 1; }
-  100% { opacity: 0; transform: translateY(100%); }
-}
-@keyframes fadeInUp {
-  from { opacity: 0; transform: translateY(16px); }
-  to   { opacity: 1; transform: translateY(0); }
-}
-@keyframes shimmer {
-  0%   { background-position: -200% center; }
-  100% { background-position: 200% center; }
-}
-@keyframes scanline {
-  0%   { top: -2px; }
-  100% { top: 100%; }
-}
-
-/* ── Animate cards in ── */
-.metric-card { animation: fadeInUp 0.4s ease both; }
-.metric-card:nth-child(1) { animation-delay: 0.05s; }
-.metric-card:nth-child(2) { animation-delay: 0.10s; }
-.metric-card:nth-child(3) { animation-delay: 0.15s; }
-.metric-card:nth-child(4) { animation-delay: 0.20s; }
-.metric-card:nth-child(5) { animation-delay: 0.25s; }
-
-/* ── Status dot ── */
 .status-dot {
   display: inline-block;
-  width: 6px; height: 6px;
+  width: 7px; height: 7px;
   border-radius: 50%;
   background: var(--green);
-  box-shadow: 0 0 8px var(--green);
-  animation: pulse-dot 2s ease-in-out infinite;
+  box-shadow: 0 0 6px var(--green);
   margin-right: 6px;
   vertical-align: middle;
-}
-@keyframes pulse-dot {
-  0%,100% { opacity:1; transform:scale(1); }
-  50%      { opacity:0.4; transform:scale(0.8); }
-}
-
-/* ── Progress bar style ── */
-.stProgress > div > div {
-  background: linear-gradient(90deg, var(--cyan), var(--purple)) !important;
-  box-shadow: 0 0 8px var(--cyan-glow) !important;
-}
-
-/* ── Multiselect tags ── */
-[data-testid="stMultiSelect"] span[data-baseweb="tag"] {
-  background: rgba(0,220,255,0.1) !important;
-  border: 1px solid rgba(0,220,255,0.25) !important;
-  color: var(--cyan) !important;
-  border-radius: 4px !important;
-  font-family: var(--font-mono) !important;
-  font-size: 11px !important;
-}
-
-/* ── Download button ── */
-.stDownloadButton button {
-  background: transparent !important;
-  border: 1px solid rgba(0,255,136,0.3) !important;
-  color: var(--green) !important;
-  font-family: var(--font-display) !important;
-  font-size: 12px !important;
-  letter-spacing: 1.5px !important;
-  border-radius: 6px !important;
-  transition: all 0.3s !important;
-}
-.stDownloadButton button:hover {
-  background: rgba(0,255,136,0.06) !important;
-  box-shadow: 0 0 20px rgba(0,255,136,0.2) !important;
-  border-color: var(--green) !important;
-}
-
-/* ── Spinner ── */
-.stSpinner > div {
-  border-top-color: var(--cyan) !important;
 }
 </style>
 """, unsafe_allow_html=True)
 
-# ─────────────────────────────────────────────────────
-#  PLOTLY THEME
-# ─────────────────────────────────────────────────────
 PLOTLY_LAYOUT = dict(
     paper_bgcolor="rgba(2,4,8,0)",
-    plot_bgcolor="rgba(4,12,20,0.6)",
+    plot_bgcolor="rgba(4,12,20,0.65)",
     font=dict(family="Rajdhani", color="#7aa0c0", size=12),
     xaxis=dict(
-        gridcolor="rgba(0,220,255,0.06)", zerolinecolor="rgba(0,220,255,0.1)",
-        showspikes=True, spikethickness=1, spikecolor="rgba(0,220,255,0.3)",
+        gridcolor="rgba(0,220,255,0.05)", zerolinecolor="rgba(0,220,255,0.08)",
+        showspikes=True, spikethickness=1, spikecolor="rgba(0,220,255,0.25)",
         tickfont=dict(family="JetBrains Mono", size=10, color="#3a5a78"),
         linecolor="rgba(0,220,255,0.1)",
     ),
     yaxis=dict(
-        gridcolor="rgba(0,220,255,0.06)", zerolinecolor="rgba(0,220,255,0.1)",
+        gridcolor="rgba(0,220,255,0.05)", zerolinecolor="rgba(0,220,255,0.08)",
         tickfont=dict(family="JetBrains Mono", size=10, color="#3a5a78"),
         linecolor="rgba(0,220,255,0.1)",
     ),
     legend=dict(
-        bgcolor="rgba(4,12,20,0.9)", bordercolor="rgba(0,220,255,0.15)",
-        borderwidth=1, font=dict(family="Rajdhani", size=12, color="#7aa0c0"),
+        bgcolor="rgba(4,12,20,0.9)", bordercolor="rgba(0,220,255,0.1)",
+        borderwidth=1, font=dict(family="Rajdhani", size=11, color="#7aa0c0"),
     ),
-    margin=dict(l=50, r=20, t=50, b=40),
+    margin=dict(l=50, r=20, t=40, b=40),
     hovermode="x unified",
-    hoverlabel=dict(
-        bgcolor="rgba(4,12,20,0.95)", bordercolor="rgba(0,220,255,0.3)",
-        font=dict(family="JetBrains Mono", size=11, color="#e8f4ff"),
-    ),
 )
 
-# ─────────────────────────────────────────────────────
-#  HELPERS
-# ─────────────────────────────────────────────────────
 def metric_card(label, value, sub="", color_class="neutral"):
     accent_map = {
-        "positive": ("linear-gradient(90deg,#00ff88,#00cc66)", "rgba(0,255,136,0.12)", "#00ff88"),
-        "negative": ("linear-gradient(90deg,#ff3366,#cc1144)", "rgba(255,51,102,0.10)", "#ff3366"),
-        "neutral":  ("linear-gradient(90deg,#00dcff,#0088cc)", "rgba(0,220,255,0.10)", "#00dcff"),
-        "warm":     ("linear-gradient(90deg,#ff8c00,#cc5500)", "rgba(255,140,0,0.10)",  "#ff8c00"),
+        "positive": ("linear-gradient(90deg,#00ff88,#00cc66)", "rgba(0,255,136,0.1)", "#00ff88"),
+        "negative": ("linear-gradient(90deg,#ff3366,#cc1144)", "rgba(255,51,102,0.08)", "#ff3366"),
+        "neutral":  ("linear-gradient(90deg,#00dcff,#0088cc)", "rgba(0,220,255,0.08)", "#00dcff"),
+        "warm":     ("linear-gradient(90deg,#ff8c00,#cc5500)", "rgba(255,140,0,0.08)",  "#ff8c00"),
     }
     grad, dim, col = accent_map.get(color_class, accent_map["neutral"])
     return f"""
@@ -1092,1881 +516,886 @@ def metric_card(label, value, sub="", color_class="neutral"):
 </div>"""
 
 def section_header(icon, title):
-    st.markdown(
-        f'<div class="section-header">'
-        f'<span class="icon">{icon}</span>'
-        f'<h3>{title}</h3>'
-        f'</div>',
-        unsafe_allow_html=True,
-    )
-
-def cyber_divider():
-    st.markdown('<div class="cyber-divider"></div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="section-header"><span>{icon}</span><h3>{title}</h3></div>', unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────
-#  DATA LOADING
+# Session State Initialization
 # ─────────────────────────────────────────────────────
-CSV_FILE = "btc_4h_data_2018_to_2025.csv"
+disk_strategy = load_active_strategy_from_disk()
 
-@st.cache_data
-def load_csv():
-    df = pd.read_csv(CSV_FILE)
+if "indicators_config" not in st.session_state:
+    if disk_strategy and "indicators" in disk_strategy:
+        st.session_state.indicators_config = disk_strategy["indicators"]
+    else:
+        st.session_state.indicators_config = {
+            "SMA": [20, 50, 200],
+            "EMA": [9, 21],
+            "RSI": [14],
+            "MACD": [[12, 26, 9]],
+            "Bollinger": [[20, 2.0]],
+            "ATR": [14],
+            "SuperTrend": [[10, 3.0]]
+        }
 
-    # Parse OHLCV columns as numeric
-    for c in ["Open", "High", "Low", "Close", "Volume"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
+if "long_entry_rules" not in st.session_state:
+    if disk_strategy:
+        st.session_state.long_entry_rules = disk_strategy.get("long_entry_rules", [])
+        st.session_state.long_exit_rules = disk_strategy.get("long_exit_rules", [])
+        st.session_state.short_entry_rules = disk_strategy.get("short_entry_rules", [])
+        st.session_state.short_exit_rules = disk_strategy.get("short_exit_rules", [])
+    else:
+        st.session_state.long_entry_rules = [
+            {"indicator1": "RSI_14", "operator": "crosses_below", "indicator2_type": "value", "value": 30.0, "indicator2": None}
+        ]
+        st.session_state.long_exit_rules = [
+            {"indicator1": "RSI_14", "operator": "crosses_above", "indicator2_type": "value", "value": 70.0, "indicator2": None}
+        ]
+        st.session_state.short_entry_rules = [
+            {"indicator1": "RSI_14", "operator": "crosses_above", "indicator2_type": "value", "value": 70.0, "indicator2": None}
+        ]
+        st.session_state.short_exit_rules = [
+            {"indicator1": "RSI_14", "operator": "crosses_below", "indicator2_type": "value", "value": 30.0, "indicator2": None}
+        ]
 
-    # Drop everything except OHLCV — the CSV timestamps are broken (all 00:00)
-    df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
-
-    # Build a clean 4-hour DatetimeIndex from scratch starting 2018-01-01
-    df.index = pd.date_range(start="2018-01-01", periods=len(df), freq="4h")
-    df.index.name = "Open time"
-    return df
-# ─────────────────────────────────────────────────────
-#  INDICATORS
-# ─────────────────────────────────────────────────────
-def add_math_metrics(df, window=15):
-    df = df.copy()
-    df["mu"] = df["Close"].rolling(window).mean()
-    df["sigma"] = df["Close"].rolling(window).std()
-    df["Z"] = (df["Close"] - df["mu"]) / df["sigma"]
-    return df
-
-def add_indicators(df, fast_span=15, slow_span=1.2, trend_span=None, atr_period=14):
-    df = add_math_metrics(df, window=fast_span)
-    z_val = 1.2 if slow_span is None else float(slow_span)
-    
-    # Mathematical Z-Score Map for backwards compatibility
-    df["EMA_Fast"]  = df["mu"]
-    df["EMA_Slow"]  = df["mu"] + z_val * df["sigma"]   # Upper Breakout Channel
-    df["EMA_Trend"] = df["mu"] - z_val * df["sigma"]   # Lower Breakout Channel
-    
-    # Volatility dispersion bounds
-    df["BB_mid"]   = df["mu"]
-    df["BB_upper"] = df["BB_mid"] + 2.0 * df["sigma"]
-    df["BB_lower"] = df["BB_mid"] - 2.0 * df["sigma"]
-    
-    # Statistical Z-Score mapped perfectly onto a [0, 100] scale
-    # Z-score of 0.0 -> 50.0, Z-score of +Z -> 50 + 15 = 65, Z-score of -Z -> 50 - 15 = 35
-    # Formula maps z_val exactly to 65: Z_scaled = 50 + (Z / z_val) * 15
-    df["RSI"] = 50.0 + (df["Z"] / z_val) * 15.0
-    df["RSI"] = df["RSI"].clip(0.0, 100.0)
-    
-    # Volatility standard deviation proxy
-    df["ATR"] = df["sigma"]
-    
-    # Dummy MACD for compliance
-    df["MACD_Hist"] = df["Z"]  # Used to check sign (>0 / <0) which exactly matches Z's sign!
-    
-    return df
-
-# ─────────────────────────────────────────────────────
-#  SWING DETECTION
-# ─────────────────────────────────────────────────────
-def swings(data, n):
-    sh = data["High"] == data["High"].rolling(n * 2 + 1, center=True).max()
-    sl = data["Low"]  == data["Low"].rolling(n * 2 + 1, center=True).min()
-    return sh, sl
-
-# ─────────────────────────────────────────────────────
-#  BACKTEST CORE
-# ─────────────────────────────────────────────────────
-def backtest(df, fast_span, risk_pct, rr, initial_capital,
-             max_leverage, fee, slippage, max_dd_allowed,
-             slow_span=None, trend_span=200, atr_mult=1.5, detailed=False):
-    # fast_span is treated as the Math Window (default 15)
-    # atr_mult is treated as the Volatility Stop Multiplier (default 1.5)
-    # slow_span is treated as Z_THRESH (default 1.2)
-    
-    z_thresh = 1.2 if slow_span is None else float(slow_span)
-    window = int(fast_span)
-    
-    capital = float(initial_capital)
-    peak = capital
-    max_dd = 0
-    position = None
-    entry = sl_price = tp_price = size = 0.0
-    trades = wins = 0
-    R_list = []
-    equity_curve = []
-    trade_records = []
-    entry_time = entry_price = risk_amt_saved = None
-
-    # Compute mathematical metrics
-    df = add_indicators(df, fast_span=window)
-
-    for i in range(window + 10, len(df)):
-        row = df.iloc[i]
-        prev_row = df.iloc[i-1]
-        
-        if position is not None:
-            exit_price = None
-            if position == "long":
-                if row["Low"] <= sl_price:
-                    exit_price = sl_price
-                elif row["High"] >= tp_price:
-                    exit_price = tp_price
-            else:
-                if row["High"] >= sl_price:
-                    exit_price = sl_price
-                elif row["Low"] <= tp_price:
-                    exit_price = tp_price
-                    
-            if exit_price is not None:
-                fee_cost = size * exit_price * fee * 2
-                pnl = (
-                    size * (exit_price - entry) - fee_cost
-                    if position == "long"
-                    else size * (entry - exit_price) - fee_cost
-                )
-                R = pnl / (size * abs(entry - sl_price)) if size * abs(entry - sl_price) > 0 else 0
-                capital += pnl
-                capital = max(capital, 1.0)
-                if pnl > 0: wins += 1
-                R_list.append(R)
-                
-                if detailed:
-                    trade_records.append({
-                        "entry_time": entry_time,
-                        "entry_price": entry_price,
-                        "exit_time": df.index[i],
-                        "exit_price": exit_price,
-                        "type": position,
-                        "pnl_currency": round(pnl, 4),
-                        "size": round(size, 6),
-                        "risk_amount": round(risk_amt_saved, 6),
-                        "R": round(R, 4),
-                        "status": "CLOSED",
-                    })
-                position = None
-        else:
-            risk_amount = capital * (risk_pct / 100)
-            
-            # Mathematical Z-Score triggers (0% Look-ahead bias, strictly completed candles)
-            prev_prev_row = df.iloc[i-2]
-            long_cross = (prev_prev_row["Z"] <= z_thresh) and (prev_row["Z"] > z_thresh)
-            short_cross = (prev_prev_row["Z"] >= -z_thresh) and (prev_row["Z"] < -z_thresh)
-            
-            if long_cross:
-                entry_p = row["Open"] * (1 + slippage) # Enter at the open of current candle
-                vol = prev_row["sigma"]
-                stop = entry_p - vol * atr_mult
-                risk = entry_p - stop
-                if risk <= 0:
-                    if detailed: equity_curve.append((df.index[i], capital))
-                    continue
-                size     = min(risk_amount / risk, capital * max_leverage)
-                tp_price = entry_p + risk * rr
-                sl_price = stop
-                position = "long"
-                trades  += 1
-                entry    = entry_p
-                if detailed:
-                    entry_time     = df.index[i]
-                    entry_price    = entry_p
-                    risk_amt_saved = risk_amount
-                    
-            elif short_cross:
-                entry_p = row["Open"] * (1 - slippage)
-                vol = prev_row["sigma"]
-                stop = entry_p + vol * atr_mult
-                risk = stop - entry_p
-                if risk <= 0:
-                    if detailed: equity_curve.append((df.index[i], capital))
-                    continue
-                size     = min(risk_amount / risk, capital * max_leverage)
-                tp_price = entry_p - risk * rr
-                sl_price = stop
-                position = "short"
-                trades  += 1
-                entry    = entry_p
-                if detailed:
-                    entry_time     = df.index[i]
-                    entry_price    = entry_p
-                    risk_amt_saved = risk_amount
-                    
-        if detailed:
-            equity_curve.append((df.index[i], capital))
-            
-        dd = (peak - capital) / peak if peak > 0 else 0
-        peak = max(peak, capital)
-        max_dd = max(max_dd, dd)
-        if max_dd > max_dd_allowed:
-            return None
-            
-    if position is not None and detailed:
-        last_row = df.iloc[-1]
-        exit_price = last_row["Close"]
-        fee_cost = size * exit_price * fee * 2
-        pnl = (
-            size * (exit_price - entry) - fee_cost
-            if position == "long"
-            else size * (entry - exit_price) - fee_cost
-        )
-        R = pnl / (size * abs(entry - sl_price)) if size * abs(entry - sl_price) > 0 else 0
-        trade_records.append({
-            "entry_time":   entry_time,
-            "entry_price":  entry_price,
-            "exit_time":    df.index[-1],
-            "exit_price":   exit_price,
-            "type":         position,
-            "pnl_currency": round(pnl, 4),
-            "size":         round(size, 6),
-            "risk_amount":  round(risk_amt_saved, 6),
-            "R":            round(R, 4),
-            "status":       "OPEN",
-        })
-        
-    if trades < 3:
-        return None
-        
-    return_pct = (capital / initial_capital - 1) * 100
-    win_rate = wins / trades * 100 if trades > 0 else 0
-    
-    result = {
-        "Swing":        fast_span, # Mapped to Swing for dashboard compatibility
-        "Risk%":        risk_pct,
-        "RR":           rr,
-        "Return%":      return_pct,
-        "WinRate":      win_rate,
-        "Expectancy":   float(np.mean(R_list)) if R_list else 0,
-        "MaxDD%":       max_dd * 100,
-        "Trades":       trades,
-        "FinalCapital": capital,
-        "R_List":       R_list,
-    }
-    if detailed:
-        result["equity_curve"] = equity_curve
-        result["trade_records"] = trade_records
-    return result
+def get_computed_columns(config):
+    cols = ["Open", "High", "Low", "Close", "Volume"]
+    if "SMA" in config:
+        for p in config["SMA"]: cols.append(f"SMA_{p}")
+    if "EMA" in config:
+        for p in config["EMA"]: cols.append(f"EMA_{p}")
+    if "WMA" in config:
+        for p in config["WMA"]: cols.append(f"WMA_{p}")
+    if "HMA" in config:
+        for p in config["HMA"]: cols.append(f"HMA_{p}")
+    if "RSI" in config:
+        for p in config["RSI"]: cols.append(f"RSI_{p}")
+    if "MACD" in config:
+        for fast, slow, sig in config["MACD"]:
+            cols.append(f"MACD_Line_{fast}_{slow}_{sig}")
+            cols.append(f"MACD_Signal_{fast}_{slow}_{sig}")
+            cols.append(f"MACD_Hist_{fast}_{slow}_{sig}")
+    if "Stochastic" in config:
+        for kp, dp in config["Stochastic"]:
+            cols.append(f"Stoch_K_{kp}_{dp}")
+            cols.append(f"Stoch_D_{kp}_{dp}")
+    if "CCI" in config:
+        for p in config["CCI"]: cols.append(f"CCI_{p}")
+    if "MFI" in config:
+        for p in config["MFI"]: cols.append(f"MFI_{p}")
+    if "ROC" in config:
+        for p in config["ROC"]: cols.append(f"ROC_{p}")
+    if "ATR" in config:
+        for p in config["ATR"]: cols.append(f"ATR_{p}")
+    if "StdDev" in config:
+        for p in config["StdDev"]: cols.append(f"StdDev_{p}")
+    if "Bollinger" in config:
+        for p, dev in config["Bollinger"]:
+            cols.append(f"BB_Upper_{p}_{dev}")
+            cols.append(f"BB_Mid_{p}_{dev}")
+            cols.append(f"BB_Lower_{p}_{dev}")
+    if "Keltner" in config:
+        for p, mult in config["Keltner"]:
+            cols.append(f"KC_Upper_{p}_{mult}")
+            cols.append(f"KC_Mid_{p}_{mult}")
+            cols.append(f"KC_Lower_{p}_{mult}")
+    if "Donchian" in config:
+        for p in config["Donchian"]:
+            cols.append(f"DC_Upper_{p}")
+            cols.append(f"DC_Mid_{p}")
+            cols.append(f"DC_Lower_{p}")
+    if "SuperTrend" in config:
+        for p, mult in config["SuperTrend"]:
+            cols.append(f"SuperTrend_{p}_{mult}")
+            cols.append(f"SuperTrend_Dir_{p}_{mult}")
+    if "Ichimoku" in config:
+        for conv, b, lead_b, lag in config["Ichimoku"]:
+            cols.append(f"Ichimoku_Tenkan_{conv}")
+            cols.append(f"Ichimoku_Kijun_{conv}")
+            cols.append(f"Ichimoku_SpanA_{conv}_{b}")
+            cols.append(f"Ichimoku_SpanB_{lead_b}")
+            cols.append(f"Ichimoku_Chikou_{lag}")
+    if "ParabolicSAR" in config:
+        for start, step, max_af in config["ParabolicSAR"]:
+            cols.append(f"SAR_{start}_{step}_{max_af}")
+            cols.append(f"SAR_Dir_{start}_{step}_{max_af}")
+    if "OBV" in config and config["OBV"]:
+        cols.append("OBV")
+    if "CMF" in config:
+        for p in config["CMF"]: cols.append(f"CMF_{p}")
+    if "VWAP" in config and config["VWAP"]:
+        cols.append("VWAP")
+    if "VolumeSMA" in config:
+        for p in config["VolumeSMA"]: cols.append(f"Volume_SMA_{p}")
+    return cols
 
 # ─────────────────────────────────────────────────────
-#  MONTE CARLO
-# ─────────────────────────────────────────────────────
-def monte_carlo(R_list, initial_capital, risk_pct, runs=1000):
-    curves = []
-    for _ in range(runs):
-        capital = float(initial_capital)
-        for _ in range(len(R_list)):
-            R = random.choice(R_list)
-            capital *= 1 + R * risk_pct / 100
-        curves.append(capital)
-    return curves
-
-
-# ─────────────────────────────────────────────────────
-#  DATA CONSTANTS
-# ─────────────────────────────────────────────────────
-from datetime import date as _date
-DATA_START = _date(2024, 1, 1)
-DATA_END   = datetime.now(timezone.utc).date()   # always today
-
-# ─────────────────────────────────────────────────────
-#  MULTI-SOURCE KLINE FETCH
-#  Binance returns 451 on Streamlit Cloud (US servers are
-#  geo-blocked). We try Bybit first, then OKX as fallback —
-#  both are globally accessible with no API key required.
-# ─────────────────────────────────────────────────────
-_BYBIT_URL    = "https://api.bybit.com/v5/market/kline"
-_OKX_CANDLES  = "https://www.okx.com/api/v5/market/candles"
-_OKX_HIST     = "https://www.okx.com/api/v5/market/history-candles"
-
-# ── Raw page fetchers ──────────────────────────────────
-
-def _bybit_page(end_ms=None, limit=200):
-    """One page of Bybit 4H candles (newest-first, max 200)."""
-    params = {"category": "spot", "symbol": "BTCUSDT",
-              "interval": "240", "limit": limit}
-    if end_ms:
-        params["end"] = end_ms
-    r = requests.get(_BYBIT_URL, params=params, timeout=15)
-    r.raise_for_status()
-    return r.json()["result"]["list"]   # [ts, O, H, L, C, Vol, Turnover]
-
-def _okx_page(after_ts=None, limit=100, history=True):
-    """One page of OKX 4H candles (newest-first, max 100/300)."""
-    url    = _OKX_HIST if history else _OKX_CANDLES
-    params = {"instId": "BTC-USDT", "bar": "4H", "limit": limit}
-    if after_ts:
-        params["after"] = after_ts          # candles BEFORE this timestamp
-    r = requests.get(url, params=params, timeout=15)
-    r.raise_for_status()
-    return r.json()["data"]                 # [ts, O, H, L, C, vol, ...]
-
-# ── DataFrame parsers ──────────────────────────────────
-
-def _df_bybit(rows):
-    if not rows:
-        return pd.DataFrame()
-    df = pd.DataFrame(rows, columns=["ts","Open","High","Low","Close","Volume","turnover"])
-    for c in ["Open","High","Low","Close","Volume"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["ts"] = pd.to_datetime(df["ts"].astype(np.int64), unit="ms")
-    df.set_index("ts", inplace=True)
-    df.index.name = "open_time"
-    return df[["Open","High","Low","Close","Volume"]].sort_index()
-
-def _df_okx(rows):
-    if not rows:
-        return pd.DataFrame()
-    df = pd.DataFrame(rows, columns=["ts","Open","High","Low","Close",
-                                      "vol","volCcy","volCcyQuote","confirm"])
-    for c in ["Open","High","Low","Close","vol"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["ts"] = pd.to_datetime(df["ts"].astype(np.int64), unit="ms")
-    df.set_index("ts", inplace=True)
-    df.index.name = "open_time"
-    return df[["Open","High","Low","Close","vol"]].rename(
-        columns={"vol": "Volume"}).sort_index()
-
-# ── High-level helpers (used by dashboard + background alerter) ──
-
-def _fetch_latest_candles(limit=300):
-    """
-    Fetch the latest `limit` 4H candles from any available exchange.
-    Returns (DataFrame, error_string_or_None).
-    """
-    # ── 1. Bybit (200 candles per request, paginate if needed) ──
-    try:
-        all_rows, end_ms, remaining = [], None, limit
-        while remaining > 0:
-            page  = min(200, remaining)
-            rows  = _bybit_page(end_ms=end_ms, limit=page)
-            if not rows:
-                break
-            all_rows.extend(rows)
-            remaining -= len(rows)
-            end_ms     = int(rows[-1][0]) - 1
-            if len(rows) < page:
-                break
-        if all_rows:
-            df = _df_bybit(all_rows)
-            if not df.empty:
-                return df.tail(limit), None
-    except Exception:
-        pass
-
-    # ── 2. OKX fallback (up to 300 candles in one shot) ──
-    try:
-        rows = _okx_page(limit=min(limit, 300), history=False)
-        if rows:
-            df = _df_okx(rows)
-            if not df.empty:
-                return df, None
-    except Exception as e:
-        return None, str(e)
-
-    return None, "All exchange sources (Bybit, OKX) failed."
-
-def _fetch_candles_range(start_dt, end_dt):
-    """
-    Fetch ALL 4H candles between start_dt and end_dt (paginated).
-    Returns DataFrame or None on failure.
-    """
-    start_ms = int(pd.Timestamp(start_dt).timestamp() * 1000)
-    end_ms   = int((pd.Timestamp(end_dt) +
-                    pd.Timedelta(hours=23, minutes=59)).timestamp() * 1000)
-
-    # ── 1. Bybit (page backwards from end_ms) ──
-    try:
-        all_rows, cur_end = [], end_ms
-        while True:
-            rows = _bybit_page(end_ms=cur_end, limit=200)
-            if not rows:
-                break
-            in_range = [r for r in rows if int(r[0]) >= start_ms]
-            all_rows.extend(in_range)
-            oldest   = int(rows[-1][0])
-            if oldest <= start_ms or len(rows) < 200:
-                break
-            cur_end  = oldest - 1
-        if all_rows:
-            df = _df_bybit(all_rows)
-            if not df.empty:
-                df = df[(df.index >= pd.Timestamp(start_dt)) &
-                        (df.index <= pd.Timestamp(end_dt) +
-                                     pd.Timedelta(hours=23, minutes=59))]
-                return df[~df.index.duplicated(keep="last")].sort_index()
-    except Exception:
-        pass
-
-    # ── 2. OKX fallback (page backwards using `after` param) ──
-    try:
-        all_rows, after_ts = [], str(end_ms)
-        while True:
-            rows = _okx_page(after_ts=after_ts, limit=100)
-            if not rows:
-                break
-            in_range = [r for r in rows if int(r[0]) >= start_ms]
-            all_rows.extend(in_range)
-            if len(in_range) < len(rows):
-                break        # oldest page crossed start_dt
-            after_ts = rows[-1][0]
-            if len(rows) < 100:
-                break
-        if all_rows:
-            df = _df_okx(all_rows)
-            if not df.empty:
-                df = df[df.index >= pd.Timestamp(start_dt)]
-                return df[~df.index.duplicated(keep="last")].sort_index()
-    except Exception:
-        pass
-
-    return None
-
-# ── Cached wrappers used by Streamlit UI ──────────────
-
-@st.cache_data(ttl=300)
-def fetch_exchange_range(start_dt, end_dt):
-    """Cached range fetch for the 2026-today data merge."""
-    return _fetch_candles_range(start_dt, end_dt)
-
-# ─────────────────────────────────────────────────────
-#  DYNAMIC HISTORICAL DATA LOADER (Bybit / OKX API)
-# ─────────────────────────────────────────────────────
-@st.cache_data(ttl=300)
-def load_full_data():
-    df_combined = fetch_exchange_range(DATA_START, DATA_END)
-    fetch_error = None
-    if df_combined is None or len(df_combined) == 0:
-        fetch_error = "Could not fetch dynamic history from Bybit/OKX APIs. Attempting local backup load."
-        # ultimate fallback to keep the app working if internet is down
-        try:
-            df_combined = pd.read_csv(CSV_FILE)
-            for c in ["Open","High","Low","Close","Volume"]:
-                if c in df_combined.columns:
-                    df_combined[c] = pd.to_numeric(df_combined[c], errors="coerce")
-            df_combined = df_combined[["Open","High","Low","Close","Volume"]].dropna()
-            df_combined.index = pd.date_range(start="2018-01-01", periods=len(df_combined), freq="4h")
-            df_combined.index.name = "Open time"
-            df_combined = df_combined[df_combined.index >= pd.Timestamp(DATA_START)]
-        except Exception as e:
-            df_combined = pd.DataFrame()
-            fetch_error += f" Backup CSV load failed: {e}"
-    return df_combined, fetch_error
-
-# ─────────────────────────────────────────────────────
-#  LIVE SIGNAL ENGINE  (Bybit / OKX — no geo-restriction)
-# ─────────────────────────────────────────────────────
-@st.cache_data(ttl=60)
-def fetch_live_candles(symbol="BTCUSDT", interval="4h", limit=300):
-    """Latest 300 candles for the live chart and signal (Bybit → OKX fallback)."""
-    return _fetch_latest_candles(limit=limit)
-
-def compute_live_signal(df_live, fast_span=15, slow_span=1.2, trend_span=200, atr_mult=1.5, rr=2.5):
-    """Run Detrended Rolling Z-Score mathematical strategy on live candles. Returns signal dict."""
-    window = int(fast_span)
-    z_thresh = float(slow_span)
-    if df_live is None or len(df_live) < window + 10:
-        return {"signal": "NO DATA", "reason": "Not enough candles",
-                "price": 0, "ema": 0, "atr": 0, "atr_median": 0,
-                "time": pd.Timestamp.utcnow(), "sl": None, "tp": None}
-
-    df = df_live.copy()
-    df = add_indicators(df, fast_span=window, slow_span=z_thresh)
-    
-    last_idx = -2
-    prev_idx = -3
-    
-    last_row = df.iloc[last_idx]
-    prev_row = df.iloc[prev_idx]
-    current_row = df.iloc[-1]
-    
-    # LONG: Z crosses above Z_THRESH
-    long_cross = (prev_row["Z"] <= z_thresh) and (last_row["Z"] > z_thresh)
-    # SHORT: Z crosses below -Z_THRESH
-    short_cross = (prev_row["Z"] >= -z_thresh) and (last_row["Z"] < -z_thresh)
-    
-    result = {
-        "signal":     "FLAT",
-        "price":      round(float(current_row["Close"]), 2),
-        "ema":        round(float(last_row["mu"]), 2),
-        "atr":        round(float(last_row["sigma"]), 2),
-        "atr_median": round(float(df["sigma"].median()), 2),
-        "time":       df.index[last_idx],
-        "reason":     "Z-score within normal statistical boundaries",
-        "sl":         None,
-        "tp":         None,
-    }
-
-    if long_cross:
-        vol = float(last_row["sigma"])
-        stop = float(current_row["Close"] - vol * atr_mult)
-        risk = current_row["Close"] - stop
-        if risk > 0:
-            result.update({
-                "signal": "LONG",
-                "sl":     round(stop, 2),
-                "tp":     round(float(current_row["Close"]) + risk * rr, 2),
-                "reason": f"Z-Score positive momentum breakout ({last_row['Z']:.2f})"
-            })
-    elif short_cross:
-        vol = float(last_row["sigma"])
-        stop = float(current_row["Close"] + vol * atr_mult)
-        risk = stop - current_row["Close"]
-        if risk > 0:
-            result.update({
-                "signal": "SHORT",
-                "sl":     round(stop, 2),
-                "tp":     round(float(current_row["Close"]) - risk * rr, 2),
-                "reason": f"Z-Score negative momentum breakout ({last_row['Z']:.2f})"
-            })
-            
-    return result
-
-# ─────────────────────────────────────────────────────
-#  EMAIL ALERT
-# ─────────────────────────────────────────────────────
-def send_signal_email(smtp_user, smtp_pass, to_email, signal_data):
-    """Send formatted HTML trade signal email via Gmail SMTP or Resend API."""
-    direction = signal_data["signal"]
-    color     = "#00ff88" if direction == "LONG" else "#ff3366"
-    arrow     = "▲ LONG"  if direction == "LONG" else "▼ SHORT"
-    subject   = f"[BTC Algo] {direction} Signal — ${signal_data['price']:,.0f}"
-
-    risk_pct_sl = abs(signal_data['price'] - signal_data['sl'])  / signal_data['price'] * 100 if signal_data['sl'] else 0
-    risk_pct_tp = abs(signal_data['tp']    - signal_data['price'])/ signal_data['price'] * 100 if signal_data['tp'] else 0
-
-    html = f"""
-    <html><body style="background:#020408;color:#e8f4ff;font-family:Arial,sans-serif;padding:24px;">
-      <div style="max-width:540px;margin:auto;background:#071020;
-                  border:1px solid {color}44;border-radius:12px;padding:28px;">
-        <div style="font-size:28px;font-weight:700;color:{color};
-                    text-shadow:0 0 20px {color};margin-bottom:4px;">
-          {arrow}
-        </div>
-        <div style="font-size:13px;color:#7aa0c0;margin-bottom:20px;">
-          BTC/USDT · 4H · {signal_data['time'].strftime('%Y-%m-%d %H:%M UTC') if hasattr(signal_data['time'], 'strftime') else str(signal_data['time'])}
-        </div>
-        <table style="width:100%;border-collapse:collapse;font-size:14px;">
-          <tr style="border-bottom:1px solid rgba(0,220,255,0.08);">
-            <td style="padding:10px 0;color:#7aa0c0;">Entry Price</td>
-            <td style="padding:10px 0;color:{color};font-weight:700;text-align:right;font-size:20px;">
-              ${signal_data['price']:,.2f}
-            </td>
-          </tr>
-          <tr style="border-bottom:1px solid rgba(0,220,255,0.08);">
-            <td style="padding:10px 0;color:#7aa0c0;">Stop Loss</td>
-            <td style="padding:10px 0;color:#ff3366;font-weight:600;text-align:right;">
-              ${signal_data['sl']:,.2f}
-              <span style="font-size:11px;color:#7aa0c0;"> ({risk_pct_sl:.2f}% risk)</span>
-            </td>
-          </tr>
-          <tr style="border-bottom:1px solid rgba(0,220,255,0.08);">
-            <td style="padding:10px 0;color:#7aa0c0;">Take Profit (3R)</td>
-            <td style="padding:10px 0;color:#00ff88;font-weight:600;text-align:right;">
-              ${signal_data['tp']:,.2f}
-              <span style="font-size:11px;color:#7aa0c0;"> (+{risk_pct_tp:.2f}%)</span>
-            </td>
-          </tr>
-          <tr style="border-bottom:1px solid rgba(0,220,255,0.08);">
-            <td style="padding:10px 0;color:#7aa0c0;">EMA200</td>
-            <td style="padding:10px 0;color:#e8f4ff;text-align:right;">${signal_data['ema']:,.2f}</td>
-          </tr>
-          <tr style="border-bottom:1px solid rgba(0,220,255,0.08);">
-            <td style="padding:10px 0;color:#7aa0c0;">ATR(14)</td>
-            <td style="padding:10px 0;color:#e8f4ff;text-align:right;">${signal_data['atr']:,.2f}</td>
-          </tr>
-          <tr>
-            <td style="padding:10px 0;color:#7aa0c0;">Reason</td>
-            <td style="padding:10px 0;color:#e8f4ff;text-align:right;">{signal_data['reason']}</td>
-          </tr>
-        </table>
-        <div style="margin-top:20px;padding:12px 16px;background:rgba(255,140,0,0.08);
-                    border-left:3px solid #ff8c00;border-radius:4px;font-size:11px;color:#7aa0c0;">
-          ⚠️ Automated algorithmic signal. Always apply your own risk management before trading.
-        </div>
-      </div>
-    </body></html>"""
-
-    # 1. Try Resend API first if configured
-    resend_api_key = ALERT_CONFIG.get("RESEND_API_KEY")
-    if resend_api_key:
-        try:
-            from_email = ALERT_CONFIG.get("FROM_EMAIL") or "onboarding@resend.dev"
-            headers = {
-                "Authorization": f"Bearer {resend_api_key}",
-                "Content-Type": "application/json"
-            }
-            data = {
-                "from": from_email,
-                "to": [to_email],
-                "subject": subject,
-                "html": html
-            }
-            res = requests.post("https://api.resend.com/emails", json=data, headers=headers, timeout=10)
-            if res.status_code in (200, 201):
-                return True, "Email sent successfully via Resend API"
-            else:
-                return False, f"Resend API error: {res.text}"
-        except Exception as e:
-            return False, f"Resend API exception: {str(e)}"
-
-    # 2. Try Gmail SMTP as fallback
-    if smtp_user and smtp_pass:
-        try:
-            msg = MIMEMultipart("alternative")
-            msg["Subject"] = subject
-            msg["From"]    = smtp_user
-            msg["To"]      = to_email
-            msg.attach(MIMEText(html, "html"))
-            ctx = ssl.create_default_context()
-            with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ctx) as server:
-                server.login(smtp_user, smtp_pass)
-                server.sendmail(smtp_user, to_email, msg.as_string())
-            return True, "Email sent successfully via SMTP"
-        except Exception as e:
-            return False, f"SMTP error: {str(e)}"
-
-    return False, "No valid email credentials found (provide Resend API Key or SMTP credentials)"
-
-
-# ─────────────────────────────────────────────────────
-# Launch background alerter (one-time; survives page refreshes via cache_resource)
-_alerter_state = start_background_alerter()
-
-# ─────────────────────────────────────────────────────
-#  LOAD FULL DATASET (CSV 2018-2025 + Binance 2026-today)
-# ─────────────────────────────────────────────────────
-df_raw, _fetch_warn = load_full_data()
-if _fetch_warn:
-    st.warning(f"⚠️ {_fetch_warn}")
-
-# Show data source summary
-_api_rows = len(df_raw)
-
-# ─────────────────────────────────────────────────────
-#  SIDEBAR
+# Sidebar Configurations
 # ─────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown(f"""
-    <div class="sidebar-logo">
-      <div class="btc-symbol">₿</div>
-      <div class="app-name">BTC Algo</div>
-      <div class="app-sub">Backtesting Suite</div>
+    <div style="text-align:center; padding:18px 0 20px;">
+      <div style="display:inline-flex; align-items:center; justify-content:center; width:52px; height:52px; background:radial-gradient(circle, rgba(0,220,255,0.15), transparent); border:1px solid rgba(0,220,255,0.25); border-radius:50%; font-size:26px; margin-bottom:8px; box-shadow:0 0 15px rgba(0,220,255,0.15); color:var(--cyan);">₿</div>
+      <div style="font-family:var(--font-display); font-size:16px; font-weight:800; letter-spacing:2px; text-transform:uppercase;">BTC Terminal</div>
+      <div style="font-family:var(--font-mono); font-size:9px; color:var(--text-dim); letter-spacing:1px; text-transform:uppercase; margin-top:2px;">Advanced Custom Backtester</div>
     </div>
     """, unsafe_allow_html=True)
-
-    st.markdown("### ⚙ Strategy")
-    fast_span = st.slider("Rolling Math Window", 5, 50, 15,
-                          help="Rolling window size for statistical mean and standard deviation")
-    slow_span = st.slider("Z-Score Threshold", 0.5, 3.0, 1.2, step=0.1,
-                          help="Statistical Z-Score threshold for momentum breakouts")
-    trend_span = 200
-
+    
+    st.markdown("### 🌐 Data Feed Provider")
+    selected_exchange = st.selectbox("Exchange", ["Bybit", "Binance", "OKX"], index=0)
+    selected_timeframe = st.selectbox("Timeframe", ["1m", "5m", "15m", "1h", "4h", "1d"], index=4)
+    
     st.markdown('<div class="cyber-divider"></div>', unsafe_allow_html=True)
-    st.markdown("### 💰 Risk Management")
-    initial_capital = st.number_input("Initial Capital ($)", 1000, 1_000_000, 10_000, step=1000)
-    risk_pct        = st.slider("Risk per Trade (%)", 0.25, 5.0, 1.5, step=0.25)
-    rr              = st.slider("Reward / Risk Ratio", 1.0, 8.0, 3.0, step=0.5)
-    max_leverage    = st.slider("Max Leverage", 1, 10, 3)
-    fee             = st.number_input("Fee per side (%)", 0.0, 0.5, 0.04, step=0.01, format="%.2f") / 100
-    slippage        = st.number_input("Slippage (%)", 0.0, 0.5, 0.03, step=0.01, format="%.2f") / 100
-    max_dd_pct      = st.slider("Max Drawdown Limit (%)", 5, 50, 25)
-    atr_mult        = st.slider("Volatility Stop Multiplier", 1.0, 4.0, 1.5, step=0.1,
-                          help="Multiplier for price standard deviation volatility stop loss")
-
+    st.markdown("### 💰 Capital & Risk Model")
+    initial_capital = st.number_input("Capital ($)", 100, 10000000, 10000, step=1000)
+    risk_pct = st.slider("Risk Per Trade (%)", 0.1, 10.0, 1.5, step=0.1)
+    leverage = st.slider("Max Leverage", 1, 100, 5)
+    
     st.markdown('<div class="cyber-divider"></div>', unsafe_allow_html=True)
-    st.markdown("### 🔬 Optimizer Grid")
-    fast_range   = st.slider("Math Window Range", 10, 30, (15, 25),
-                          help="Range of rolling windows to sweep in parameter optimization")
-    risk_options = st.multiselect(
-        "Risk% Values", [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0], default=[0.5, 1.0, 1.5]
-    )
-    rr_options = st.multiselect(
-        "RR Values", [1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0], default=[2.0, 3.0, 4.0, 5.0]
-    )
-
+    st.markdown("### ⚙️ Orders & Execution")
+    fee_pct = st.number_input("Fee Rate (%)", 0.0, 1.0, 0.04, step=0.01, format="%.2f")
+    slip_pct = st.number_input("Slippage (%)", 0.0, 1.0, 0.03, step=0.01, format="%.2f")
+    max_drawdown_limit = st.slider("Max Drawdown Stop (%)", 5, 100, 30)
+    
     st.markdown('<div class="cyber-divider"></div>', unsafe_allow_html=True)
-    st.markdown("### 🎲 Monte Carlo")
-    mc_runs = st.slider("Simulations", 200, 5000, 1000, step=100)
-
+    st.markdown("### 🛑 Exit Constraints")
+    stop_loss_type = st.selectbox("Stop Loss Model", ["ATR", "Percent", "Fixed"], index=0)
+    
+    if stop_loss_type == "ATR":
+        stop_loss_val = st.number_input("ATR Multiplier", 0.5, 10.0, 2.0, step=0.1)
+    elif stop_loss_type == "Percent":
+        stop_loss_val = st.number_input("Loss Distance (%)", 0.1, 20.0, 2.0, step=0.1)
+    else:
+        stop_loss_val = st.number_input("Fixed Distance ($)", 10.0, 50000.0, 500.0, step=50.0)
+        
+    take_profit_type = st.selectbox("Take Profit Model", ["RR", "Percent", "Fixed"], index=0)
+    rr_ratio = 3.0
+    take_profit_val = 3.0
+    
+    if take_profit_type == "RR":
+        rr_ratio = st.number_input("Reward-to-Risk (R)", 0.5, 20.0, 3.0, step=0.5)
+    elif take_profit_type == "Percent":
+        take_profit_val = st.number_input("Profit Distance (%)", 0.1, 100.0, 6.0, step=0.5)
+    else:
+        take_profit_val = st.number_input("Fixed Profit ($)", 10.0, 100000.0, 1500.0, step=100.0)
+        
     st.markdown('<div class="cyber-divider"></div>', unsafe_allow_html=True)
-
-    st.markdown('<div class="cyber-divider"></div>', unsafe_allow_html=True)
-    # Secure: Use only backend credentials so no one can see them
-    def get_secret(key, fallback=""):
-       try:
-          return st.secrets[key]
-       except Exception:
-          return os.getenv(key, fallback)
-
-    active_smtp_user   = get_secret("SMTP_USER")
-    active_smtp_pass   = get_secret("SMTP_PASS")
-    active_alert_email = get_secret("ALERT_EMAIL", "don911911911@gmail.com")
-    active_resend_key  = get_secret("RESEND_API_KEY", "re_K97oEzZ2_Afwrd4YTQKJZzYX9F8wKkw2P")
-    active_from_email  = get_secret("FROM_EMAIL", "onboarding@resend.dev")
-
-    st.markdown('<div class="cyber-divider"></div>', unsafe_allow_html=True)
-    run_btn = st.button("▶  RUN BACKTEST",    use_container_width=True)
-    opt_btn = st.button("⚡  OPTIMIZE PARAMS", use_container_width=True)
-
-    st.markdown(f"""
-    <div style="margin-top:20px;padding:12px;background:rgba(0,220,255,0.04);
-                border:1px solid rgba(0,220,255,0.08);border-radius:8px;">
-      <div style="font-family:var(--font-mono);font-size:9px;color:var(--text-dim);
-                  letter-spacing:1px;text-transform:uppercase;margin-bottom:6px;">Dataset Info</div>
-      <div style="font-family:var(--font-mono);font-size:10px;color:var(--text-mid);">
-        {DATA_START.strftime('%b %d, %Y')} → {DATA_END.strftime('%b %d, %Y')}<br>
-        {len(df_raw):,} total candles · 4H<br>
-        Bybit/OKX APIs (No CSV)
-      </div>
-    </div>
-    """, unsafe_allow_html=True)
+    run_backtest_btn = st.button("▶  RUN BACKTEST", use_container_width=True)
+    
+    # Alerter service status display removed.
 
 # ─────────────────────────────────────────────────────
-#  DEBUG — show parsed data range so user can verify
+# Main Terminal Header
 # ─────────────────────────────────────────────────────
-st.markdown(f"""
-<div style="background:rgba(0,220,255,0.05);border:1px solid rgba(0,220,255,0.15);
-            border-radius:8px;padding:10px 16px;margin-bottom:12px;
-            font-family:'JetBrains Mono',monospace;font-size:11px;color:#7aa0c0;">
-  📂 &nbsp;<b style="color:#00dcff">Dataset loaded:</b>
-  &nbsp;{DATA_START.strftime('%Y-%m-%d')} → {DATA_END.strftime('%Y-%m-%d')}
-  &nbsp;·&nbsp; {len(df_raw):,} candles
-</div>
-""", unsafe_allow_html=True)
+section_header("₿", "BTC Custom Backtesting Terminal")
 
-# ─────────────────────────────────────────────────────
-#  DATE FILTER
-#  Rules:
-#   • value= sets the INITIAL default only (Streamlit persists
-#     widget state across reruns automatically via position key)
-#   • min_value / max_value lock the calendar to dataset bounds
-#   • NO st.session_state used — avoids stale-value overwrites
-# ─────────────────────────────────────────────────────
+# Dates
 col_d1, col_d2 = st.columns(2)
 with col_d1:
-    date_start = st.date_input(
-        "📅 Backtest From",
-        value=DATA_START,
-        min_value=DATA_START,
-        max_value=DATA_END,
-        key="widget_date_start",
-    )
+    date_start = st.date_input("From Date", value=_date(2024, 1, 1), min_value=_date(2018, 1, 1))
 with col_d2:
-    date_end = st.date_input(
-        "📅 Backtest To",
-        value=DATA_END,
-        min_value=DATA_START,
-        max_value=DATA_END,
-        key="widget_date_end",
-    )
-
+    date_end = st.date_input("To Date", value=_date(2026, 5, 31), min_value=_date(2018, 1, 1))
+    
 if date_start > date_end:
-    st.error("⚠️ 'From' date must be before 'To' date.")
+    st.error("Error: Start date must be before end date.")
     st.stop()
 
-# ── Clear cached results when any key param changes ──
-_state_key = (str(date_start), str(date_end), fast_span, slow_span, trend_span, risk_pct, rr, atr_mult)
-if st.session_state.get("_last_state_key") != _state_key:
-    st.session_state.pop("last_result", None)
-    st.session_state.pop("mc_curves",   None)
-    st.session_state["_last_state_key"] = _state_key
+# ─────────────────────────────────────────────────────
+# Data Fetch & Computation
+# ─────────────────────────────────────────────────────
+@st.cache_data(ttl=600)
+def get_clean_dataset(exchange, symbol, timeframe, start, end):
+    return data_loader.load_dataset(exchange, symbol, timeframe, start, end)
 
-# Slice — end of selected day inclusive
-df = df_raw.loc[
-    pd.Timestamp(date_start) : pd.Timestamp(date_end) + pd.Timedelta(hours=23, minutes=59)
-].copy()
+df_raw, fetch_warn = get_clean_dataset(selected_exchange, "BTCUSDT", selected_timeframe, date_start, date_end)
 
-if len(df) < 100:
-    st.error(f"⚠️ Only {len(df)} candles in selected range — please widen the window.")
+if df_raw.empty:
+    st.error("Error: No data loaded. Check connection or adjust dates.")
     st.stop()
 
-df = add_indicators(df, fast_span=fast_span, slow_span=slow_span, trend_span=trend_span)
+if fetch_warn:
+    st.warning(fetch_warn)
 
-# ─────────────────────────────────────────────────────
-#  HERO BANNER
-# ─────────────────────────────────────────────────────
-price_now  = df["Close"].iloc[-1]
-price_open = df["Close"].iloc[0]
-period_ret = (price_now / price_open - 1) * 100
-candle_cnt = len(df)
+# Append indicator computations
+df_computed = indicators.compute_all_indicators(df_raw, st.session_state.indicators_config)
 
+# Show dynamic data loading panel info
 st.markdown(f"""
-<div class="hero-banner">
-  <div style="display:flex;align-items:center;gap:28px;flex-wrap:wrap;">
-    <div>
-      <div class="hero-title">BTC Algo Trader Pro</div>
-      <div class="hero-sub">
-        <span class="status-dot"></span>
-        EMA Trend Filter · ATR Regime · Swing Structure · Risk-Managed Entries
-      </div>
-      <div class="hero-badge">4H · BTCUSDT · Binance Historical</div>
-    </div>
-    <div style="margin-left:auto;display:flex;gap:36px;flex-wrap:wrap;">
-      <div>
-        <div class="hero-stat-label">Data Window</div>
-        <div class="hero-stat-value">{date_start.strftime('%b %d %Y')} → {date_end.strftime('%b %d %Y')}</div>
-      </div>
-      <div>
-        <div class="hero-stat-label">Candles</div>
-        <div class="hero-stat-value">{candle_cnt:,}</div>
-      </div>
-      <div>
-        <div class="hero-stat-label">Period Return</div>
-        <div class="hero-stat-value" style="color:{'#00ff88' if period_ret>=0 else '#ff3366'}">
-          {period_ret:+.1f}%
-        </div>
-      </div>
-      <div>
-        <div class="hero-stat-label">Last Close</div>
-        <div class="hero-stat-value">${price_now:,.0f}</div>
-      </div>
-    </div>
-  </div>
+<div style="background:rgba(0,220,255,0.03); border:1px solid rgba(0,220,255,0.1); border-radius:6px; padding:10px 14px; margin-bottom:14px; font-family:'JetBrains Mono',monospace; font-size:11px;">
+  📂 &nbsp;<b>Data Feed:</b> {selected_exchange} Spot BTCUSDT &nbsp;|&nbsp; <b>Timeframe:</b> {selected_timeframe} &nbsp;|&nbsp; <b>Candles Loaded:</b> {len(df_computed):,} &nbsp;|&nbsp; <b>Range:</b> {df_computed.index[0].strftime('%Y-%m-%d')} → {df_computed.index[-1].strftime('%Y-%m-%d')}
 </div>
 """, unsafe_allow_html=True)
 
-# ─────────────────────────────────────────────────────
-#  TABS
-# ─────────────────────────────────────────────────────
-tab_live, tab_overview, tab_chart, tab_backtest, tab_optimizer, tab_mc, tab_trades = st.tabs([
-    "🔴 LIVE SIGNALS", "◈ OVERVIEW", "◈ PRICE CHART", "◈ BACKTEST", "◈ OPTIMIZER", "◈ MONTE CARLO", "◈ TRADE LOG"
+# Tabs
+tab_live, tab_strat, tab_chart, tab_back, tab_opt, tab_mc, tab_log = st.tabs([
+    "🔴 LIVE MONITOR", "🛠️ STRATEGY BUILDER", "📈 PRICE CHART", "🔬 BACKTEST REPORT", "⚡ PARAM OPTIMIZER", "🎲 MONTE CARLO", "📋 TRADE LOG"
 ])
 
 # ══════════════════════════════════════════════════════
-
-# ══════════════════════════════════════════════════════
-#  TAB 0 — LIVE SIGNALS
+# TAB 1: LIVE MONITOR & ALERTER
 # ══════════════════════════════════════════════════════
 with tab_live:
-    section_header("\U0001f534", "Live BTC/USDT Signal Monitor")
-
-    st.markdown(
-        '<div style="font-family:var(--font-mono);font-size:10px;color:var(--text-dim);'
-        'margin-bottom:12px;letter-spacing:1px;">'
-        '<span class="status-dot"></span> Auto-refreshes every 60 s · Binance 4H feed</div>',
-        unsafe_allow_html=True,
-    )
-
-    df_live, fetch_err = fetch_live_candles("BTCUSDT", "4h", 300)
-
-    if fetch_err:
-        st.error(f"⚠️ Could not fetch live data from Binance: {fetch_err}")
-    else:
-        sig = compute_live_signal(df_live, fast_span=fast_span, slow_span=slow_span, trend_span=trend_span, atr_mult=atr_mult, rr=rr)
-        s_type = sig["signal"]
-        s_color_map = {"LONG": "#00ff88", "SHORT": "#ff3366", "FLAT": "#00dcff", "NO DATA": "#ff8c00"}
-        s_color = s_color_map.get(s_type, "#00dcff")
-        s_bg_map = {
-            "LONG":    "rgba(0,255,136,0.06)",
-            "SHORT":   "rgba(255,51,102,0.06)",
-            "FLAT":    "rgba(0,220,255,0.04)",
-            "NO DATA": "rgba(255,140,0,0.06)",
-        }
-        s_bg    = s_bg_map.get(s_type, "rgba(0,220,255,0.04)")
-        arrow   = {"LONG": "\u25b2", "SHORT": "\u25bc", "FLAT": "\u25c6", "NO DATA": "?"}.get(s_type, "\u25c6")
-
-        st.markdown(
-            f'<div style="background:{s_bg};border:2px solid {s_color};border-radius:16px;'
-            f'padding:28px 36px;text-align:center;margin:12px 0 24px;">'
-            f'<div style="font-family:var(--font-display);font-size:52px;font-weight:800;'
-            f'color:{s_color};letter-spacing:4px;text-shadow:0 0 30px {s_color};line-height:1;">'
-            f'{arrow} {s_type}</div>'
-            f'<div style="font-family:var(--font-mono);font-size:13px;color:var(--text-mid);margin-top:10px;">'
-            f'{sig["reason"] or "No trade conditions met"}</div>'
-            f'<div style="font-family:var(--font-mono);font-size:11px;color:var(--text-dim);margin-top:6px;">'
-            f'Signal time: {sig["time"].strftime("%Y-%m-%d %H:%M UTC") if sig.get("time") else "N/A"}'
-            f'</div></div>',
-            unsafe_allow_html=True,
-        )
-
-        c1, c2, c3, c4, c5 = st.columns(5)
-        price_change = ((df_live["Close"].iloc[-1] / df_live["Close"].iloc[-2]) - 1) * 100 if len(df_live) > 1 else 0
-        sl_dist = f"{abs(sig['price'] - sig['sl']) / sig['price'] * 100:.2f}% from entry" if sig['sl'] else "No signal"
-        tp_dist = f"{abs(sig['tp'] - sig['price']) / sig['price'] * 100:.2f}% from entry" if sig['tp'] else "No signal"
-        for col, label, val, sub, clr in [
-            (c1, "BTC Price",    f"${sig['price']:,.2f}",                        f"{price_change:+.2f}% last candle",        "positive" if price_change >= 0 else "negative"),
-            (c2, "EMA 200",      f"${sig['ema']:,.2f}",                          "Trend baseline",                           "neutral"),
-            (c3, "ATR (14)",     f"${sig['atr']:,.2f}",                          f"Median: ${sig['atr_median']:,.2f}",        "positive" if sig['atr'] >= sig['atr_median'] else "warm"),
-            (c4, "Stop Loss",    f"${sig['sl']:,.2f}" if sig['sl'] else "\u2014", sl_dist,                                   "negative"),
-            (c5, "Take Profit",  f"${sig['tp']:,.2f}" if sig['tp'] else "\u2014", tp_dist,                                   "positive"),
-        ]:
-            with col:
-                st.markdown(metric_card(label, val, sub, clr), unsafe_allow_html=True)
-
-        st.markdown("<br>", unsafe_allow_html=True)
-        section_header("\U0001f4e7", "Signal Email Alert")
-
-        col_em1, col_em2 = st.columns([2, 1])
-        with col_em1:
-            if s_type in ("LONG", "SHORT"):
-                if st.button("\U0001f4e8  Send Signal Email Now", use_container_width=True):
-                    if not (active_resend_key or (active_smtp_user and active_smtp_pass)) or not active_alert_email:
-                        st.error("⚠️ Credentials not found in environment/secrets. Cannot send email.")
-                    else:
-                        with st.spinner("Sending email…"):
-                            ok, msg_out = send_signal_email(active_smtp_user, active_smtp_pass, active_alert_email, sig)
-                        if ok:
-                            st.success(f"✅ Email sent to {active_alert_email}")
-                        else:
-                            st.error(f"❌ Failed: {msg_out}")
-            else:
-                st.markdown(
-                    '<div class="info-box">No active signal — email alert will be available '
-                    'when a LONG or SHORT signal fires.</div>',
-                    unsafe_allow_html=True,
-                )
-        with col_em2:
-            st.markdown(
-                '<div class="info-box"><b>Auto-refresh:</b> Page reloads every 60 s.<br>'
-                'Alerts are sent automatically if credentials are set in secrets.</div>',
-                unsafe_allow_html=True,
-            )
-        
-        with st.expander("ℹ️ &nbsp; Email Server Configuration & Render.com Guide", expanded=False):
-            st.markdown("""
-            ### 🌐 Outbound Email Routing Guide
-            
-            #### ⚠️ **Render.com Free Tier Port Block (Error 101)**
-            If you are hosting this dashboard on **Render.com's Free Tier**, standard SMTP outbound connections on ports **25, 465, and 587** are blocked by Render's firewall to prevent spam. This causes a `[Errno 101] Network is unreachable` or timeout error.
-            
-            #### 🚀 **The Solution: Resend API (HTTP-based HTTPS port 443)**
-            Instead of standard SMTP, this dashboard has built-in support for the modern **Resend API** which sends emails via secure HTTPS (port 443). Since port 443 is wide open, this works flawlessly on Render Free!
-            
-            **How to set up Resend:**
-            1. Sign up for a free account at [resend.com](https://resend.com) (includes 3,000 free emails/month).
-            2. Get your **API Key** from the Resend dashboard.
-            3. Add the following key-value pairs in your Streamlit secrets (`.streamlit/secrets.toml` or Render Environment Variables):
-               ```toml
-               RESEND_API_KEY = "re_YourActualApiKey"
-               FROM_EMAIL = "onboarding@resend.dev"
-               ALERT_EMAIL = "your-receiving-email@domain.com"
-               ```
-               *Note: For the free onboarding plan, the `FROM_EMAIL` must be `onboarding@resend.dev` and the `ALERT_EMAIL` must be the email address you registered with Resend.*
-            
-            #### 📧 **Standard Gmail SMTP Method**
-            If running locally or on a paid tier where SMTP ports are open, you can configure standard SMTP:
-            ```toml
-            SMTP_USER = "your-gmail-username@gmail.com"
-            SMTP_PASS = "your-gmail-app-password"
-            ALERT_EMAIL = "your-receiving-email@gmail.com"
-            ```
-            """, unsafe_allow_html=True)
-
-        section_header("\U0001f4c8", "Live Price Chart \u2014 Last 100 Candles")
-        df_live_ind = add_indicators(df_live, fast_span=fast_span, slow_span=slow_span, trend_span=trend_span)
-        df_plot = df_live_ind.tail(100)
-        fig_live = make_subplots(rows=2, cols=1, shared_xaxes=True,
-                                 vertical_spacing=0.03, row_heights=[0.75, 0.25])
-        fig_live.add_trace(go.Candlestick(
-            x=df_plot.index, open=df_plot["Open"], high=df_plot["High"],
-            low=df_plot["Low"], close=df_plot["Close"],
-            increasing_line_color="#00ff88", decreasing_line_color="#ff3366",
-            increasing_fillcolor="rgba(0,255,136,0.7)", decreasing_fillcolor="rgba(255,51,102,0.7)",
-            name="OHLC", showlegend=False,
-        ), row=1, col=1)
-        fig_live.add_trace(go.Scatter(
-            x=df_plot.index, y=df_plot["EMA_Fast"].values,
-            line=dict(color="#00ff88", width=1.2), name=f"EMA Fast ({fast_span})",
-        ), row=1, col=1)
-        fig_live.add_trace(go.Scatter(
-            x=df_plot.index, y=df_plot["EMA_Slow"].values,
-            line=dict(color="#ff3366", width=1.2), name=f"EMA Slow ({slow_span})",
-        ), row=1, col=1)
-        fig_live.add_trace(go.Scatter(
-            x=df_plot.index, y=df_plot["EMA_Trend"].values,
-            line=dict(color="#ff8c00", width=1.5), name=f"EMA Trend ({trend_span})",
-        ), row=1, col=1)
-        if s_type in ("LONG", "SHORT"):
-            fig_live.add_trace(go.Scatter(
-                x=[df_plot.index[-1]],
-                y=[df_plot["Low"].iloc[-1] * 0.997 if s_type == "LONG" else df_plot["High"].iloc[-1] * 1.003],
-                mode="markers+text",
-                marker=dict(symbol="triangle-up" if s_type == "LONG" else "triangle-down",
-                            color=s_color, size=16, line=dict(color="white", width=1)),
-                text=[s_type],
-                textposition="bottom center" if s_type == "LONG" else "top center",
-                textfont=dict(color=s_color, size=11, family="JetBrains Mono"),
-                name=f"Signal: {s_type}",
-            ), row=1, col=1)
-            if sig["sl"]:
-                fig_live.add_hline(y=sig["sl"], line_dash="dash", line_color="#ff3366", line_width=1.2,
-                                   row=1, col=1,
-                                   annotation_text=f"SL ${sig['sl']:,.0f}",
-                                   annotation_font=dict(color="#ff3366", family="JetBrains Mono", size=10))
-            if sig["tp"]:
-                fig_live.add_hline(y=sig["tp"], line_dash="dash", line_color="#00ff88", line_width=1.2,
-                                   row=1, col=1,
-                                   annotation_text=f"TP ${sig['tp']:,.0f}",
-                                   annotation_font=dict(color="#00ff88", family="JetBrains Mono", size=10))
-        vol_colors = ["rgba(0,255,136,0.5)" if c >= o else "rgba(255,51,102,0.5)"
-                      for c, o in zip(df_plot["Close"], df_plot["Open"])]
-        fig_live.add_trace(go.Bar(x=df_plot.index, y=df_plot["Volume"],
-                                  marker_color=vol_colors, name="Volume"), row=2, col=1)
-        fig_live.update_layout(**PLOTLY_LAYOUT, height=560,
-                               title="BTC/USDT Live 4H  \u00b7  Binance",
-                               xaxis_rangeslider_visible=False)
-        fig_live.update_yaxes(title_text="Price (USD)", row=1)
-        fig_live.update_yaxes(title_text="Volume", row=2)
-        st.plotly_chart(fig_live, use_container_width=True)
-
-        section_header("📋", "Signal History (This Session)")
-
-        if "signal_history" not in st.session_state:
-            st.session_state["signal_history"] = []
-        if "last_auto_email_time" not in st.session_state:
-            st.session_state["last_auto_email_time"] = None
-
-        if s_type in ("LONG", "SHORT"):
-            cur_time_str = sig["time"].strftime("%Y-%m-%d %H:%M")
-            last_logged  = st.session_state["signal_history"][-1]["Time"] if st.session_state["signal_history"] else None
-
-            # Log new signal
-            if last_logged != cur_time_str:
-                st.session_state["signal_history"].append({
-                    "Time":   cur_time_str,
-                    "Signal": s_type,
-                    "Price":  f"${sig['price']:,.2f}",
-                    "SL":     f"${sig['sl']:,.2f}",
-                    "TP":     f"${sig['tp']:,.2f}",
-                    "Reason": sig["reason"],
-                    "Email":  "Pending",
-                })
-
-                # AUTO-SEND email for every new signal
-                if (active_resend_key or (active_smtp_user and active_smtp_pass)) and active_alert_email:
-                    with st.spinner("📧 New signal — sending email…"):
-                        ok, msg_out = send_signal_email(active_smtp_user, active_smtp_pass, active_alert_email, sig)
-                    if ok:
-                        st.session_state["signal_history"][-1]["Email"] = "✅ Sent"
-                        st.session_state["last_auto_email_time"] = cur_time_str
-                        st.success(f"✅ Auto-email sent to {active_alert_email} — {s_type} @ {cur_time_str}")
-                    else:
-                        st.session_state["signal_history"][-1]["Email"] = f"❌ {msg_out}"
-                        st.warning(f"⚠️ Auto-email failed: {msg_out}")
-                else:
-                    st.session_state["signal_history"][-1]["Email"] = "No credentials set"
-
-        if st.session_state["signal_history"]:
-            st.dataframe(pd.DataFrame(st.session_state["signal_history"][::-1]),
-                         use_container_width=True, hide_index=True, height=280)
-        else:
-            st.markdown(
-                '<div class="info-box">No signals yet this session. '
-                'Signals log automatically; email fires if backend credentials are set.</div>',
-                unsafe_allow_html=True,
-            )
-
-        if st.session_state.get("last_auto_email_time"):
-            st.markdown(
-                f'<div class="info-box">📧 Last auto-email: {st.session_state["last_auto_email_time"]}</div>',
-                unsafe_allow_html=True,
-            )
-
-        # ── Background Alerter Status ────────────────────
-        cyber_divider()
-        section_header("🤖", "24/7 Background Alerter Status")
-
-        _s = _alerter_state
-        _running_color = "#00ff88" if _s["running"] else "#ff8c00"
-        _running_label = "RUNNING" if _s["running"] else "STARTING…"
+    section_header("\U0001f534", "Live Alerter Feed")
+    
+    col_al1, col_al2 = st.columns([2, 1])
+    with col_al1:
         st.markdown(f"""
-        <div style="background:rgba(0,220,255,0.04);border:1px solid rgba(0,220,255,0.15);
-                    border-radius:10px;padding:18px 22px;margin:8px 0;">
-          <div style="display:flex;gap:32px;flex-wrap:wrap;align-items:center;">
-            <div>
-              <div style="font-family:var(--font-mono);font-size:9px;color:var(--text-dim);
-                          letter-spacing:1px;text-transform:uppercase;">Thread Status</div>
-              <div style="font-family:var(--font-display);font-size:18px;font-weight:700;
-                          color:{_running_color};margin-top:4px;">
-                <span style="display:inline-block;width:8px;height:8px;border-radius:50%;
-                             background:{_running_color};margin-right:6px;
-                             box-shadow:0 0 8px {_running_color};"></span>
-                {_running_label}
-              </div>
-            </div>
-            <div>
-              <div style="font-family:var(--font-mono);font-size:9px;color:var(--text-dim);
-                          letter-spacing:1px;text-transform:uppercase;">Last Check</div>
-              <div style="font-family:var(--font-mono);font-size:13px;color:var(--text-mid);margin-top:4px;">
-                {_s["last_check"] or "Pending…"}
-              </div>
-            </div>
-            <div>
-              <div style="font-family:var(--font-mono);font-size:9px;color:var(--text-dim);
-                          letter-spacing:1px;text-transform:uppercase;">Last BG Signal</div>
-              <div style="font-family:var(--font-display);font-size:15px;font-weight:700;
-                          color:{"#00ff88" if _s["last_signal"]=="LONG" else "#ff3366" if _s["last_signal"]=="SHORT" else "#00dcff"};
-                          margin-top:4px;">
-                {_s["last_signal"]}
-                {"  $"+f"{_s['last_price']:,.0f}" if _s["last_price"] else ""}
-              </div>
-            </div>
-            <div>
-              <div style="font-family:var(--font-mono);font-size:9px;color:var(--text-dim);
-                          letter-spacing:1px;text-transform:uppercase;">Emails Sent</div>
-              <div style="font-family:var(--font-display);font-size:18px;font-weight:700;
-                          color:#00ff88;margin-top:4px;">{_s["emails_sent"]}</div>
-            </div>
-            <div>
-              <div style="font-family:var(--font-mono);font-size:9px;color:var(--text-dim);
-                          letter-spacing:1px;text-transform:uppercase;">Errors</div>
-              <div style="font-family:var(--font-display);font-size:18px;font-weight:700;
-                          color:{"#ff3366" if _s["errors"] else "#3a5a78"};margin-top:4px;">
-                {_s["errors"]}
-              </div>
-            </div>
+        <div style="background:rgba(0,220,255,0.03); border:1px solid var(--border-glow); border-radius:12px; padding:24px; text-align:center; margin-bottom:16px;">
+          <div style="font-family:var(--font-display); font-size:42px; font-weight:800; color:{'#00ff88' if _alerter_state.get('active_trade') else '#00dcff'}; text-shadow:0 0 20px rgba(0,220,255,0.25); line-height:1;">
+             {_alerter_state.get('last_signal', 'FLAT')}
+          </div>
+          <div style="font-family:var(--font-mono); font-size:13px; color:var(--text-mid); margin-top:8px;">
+            Current BTC Price: <b>${_alerter_state.get('last_price', 0.0):,.2f}</b>
+          </div>
+          <div style="font-family:var(--font-mono); font-size:11px; color:var(--text-dim); margin-top:4px;">
+            Last Evaluation: {_alerter_state.get('last_check', 'Pending...')}
           </div>
         </div>
-        <div style="font-family:var(--font-mono);font-size:10px;color:var(--text-dim);
-                    padding:6px 4px;line-height:1.8;">
-          ⚡ Background thread checks Binance every 30 min and emails
-          <b style="color:var(--cyan)">{ALERT_CONFIG["ALERT_EMAIL"]}</b> on every new LONG/SHORT — 
-          even when the browser is closed.<br>
-          ⚠️ On Streamlit Community Cloud free tier, the app sleeps after ~15 min with no visitors.
-          To prevent sleep, add a free <b style="color:#ff8c00">UptimeRobot</b> monitor that
-          pings your app URL every 5 minutes.
+        """, unsafe_allow_html=True)
+        
+        # Alerter Stats
+        c_as1, c_as2 = st.columns(2)
+        with c_as1:
+            st.markdown(metric_card("Thread Status", "RUNNING" if _alerter_state.get("running") else "OFFLINE", "24/7 Signal Engine", "positive" if _alerter_state.get("running") else "negative"), unsafe_allow_html=True)
+        with c_as2:
+            st.markdown(metric_card("Loop Errors", str(_alerter_state.get("errors", 0)), "Log errors count", "negative" if _alerter_state.get("errors", 0) > 0 else "neutral"), unsafe_allow_html=True)
+            
+    with col_al2:
+        st.markdown("""
+        <div class="info-box" style="height:100%;">
+          <b>Background Signal Engine</b><br><br>
+          This service runs a daemon thread in the background. On every loop cycle (every 60 seconds), it:<br>
+          1. Reloads the serialized strategy from <code>active_strategy.json</code>.<br>
+          2. Pulls live feed data for the chosen timeframe from exchanges.<br>
+          3. Evaluates strategy logic on the closed candle.<br>
+          4. Checks for TP/SL breakouts on live price ticks.<br>
+          5. Logs signals and positions to the activity monitor below.<br><br>
+          <i>Saves state dynamically to <code>alerter_state.json</code> to persist across app updates.</i>
         </div>
         """, unsafe_allow_html=True)
-
-        if _s["log"]:
-            st.markdown("**Background Alerter Email Log** (last 20 signals):", unsafe_allow_html=False)
-            st.dataframe(pd.DataFrame(_s["log"]), use_container_width=True, hide_index=True, height=220)
-
-
-#  TAB 1 — OVERVIEW
-# ══════════════════════════════════════════════════════
-with tab_overview:
-    section_header("◈", "Market Metrics — Selected Range")
-
-    # All metrics computed from actual filtered dataset
-    price_ret    = (df["Close"].iloc[-1] / df["Close"].iloc[0] - 1) * 100
-    ann_vol      = df["Close"].pct_change().std() * 100 * np.sqrt(6 * 365)
-    max_price    = df["High"].max()
-    min_price    = df["Low"].min()
-    avg_vol_btc  = df["Volume"].mean()
-    sharpe_proxy = (df["Close"].pct_change().mean() / df["Close"].pct_change().std()) * np.sqrt(6 * 365)
-
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
-    metrics = [
-        (c1, "Last Close",    f"${df['Close'].iloc[-1]:,.0f}",  f"Open: ${df['Close'].iloc[0]:,.0f}", "neutral"),
-        (c2, "Period Return", f"{price_ret:+.1f}%",             f"{date_start} → {date_end}",         "positive" if price_ret >= 0 else "negative"),
-        (c3, "Ann. Volatility",f"{ann_vol:.1f}%",               "Annualised 4H sigma",                "warm"),
-        (c4, "Range High",    f"${max_price:,.0f}",             f"Low: ${min_price:,.0f}",             "positive"),
-        (c5, "Avg Vol (BTC)", f"{avg_vol_btc:,.1f}",            "Per 4H candle",                      "neutral"),
-        (c6, "Sharpe (proxy)",f"{sharpe_proxy:.2f}",            "Daily log returns",                   "positive" if sharpe_proxy > 1 else "warm"),
-    ]
-    for col, label, val, sub, clr in metrics:
-        with col:
-            st.markdown(metric_card(label, val, sub, clr), unsafe_allow_html=True)
-
+        
     st.markdown("<br>", unsafe_allow_html=True)
-    section_header("◈", "Monthly Returns Heatmap")
-
-    col_l, col_r = st.columns([3, 2])
-    with col_l:
-        monthly    = df["Close"].resample("ME").last().pct_change() * 100
-        monthly_df = monthly.dropna().reset_index()
-        monthly_df.columns = ["Date", "Return"]
-        monthly_df["Year"]  = monthly_df["Date"].dt.year
-        monthly_df["Month"] = monthly_df["Date"].dt.strftime("%b")
-        pivot = monthly_df.pivot_table(values="Return", index="Year", columns="Month")
-        month_order = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
-        pivot = pivot.reindex(columns=[m for m in month_order if m in pivot.columns])
-
-        fig_heat = go.Figure(go.Heatmap(
-            z=pivot.values,
-            x=pivot.columns.tolist(),
-            y=[str(y) for y in pivot.index.tolist()],
-            colorscale=[
-                [0.0, "#ff3366"], [0.35, "#220010"],
-                [0.5, "#071020"],
-                [0.65, "#002210"], [1.0, "#00ff88"],
-            ],
-            text=[[f"{v:+.1f}%" if not np.isnan(v) else "—" for v in row] for row in pivot.values],
-            texttemplate="%{text}",
-            textfont={"size": 10, "family": "JetBrains Mono", "color": "#e8f4ff"},
-            zmid=0,
-            showscale=True,
-            colorbar=dict(
-                tickfont=dict(color="#7aa0c0", family="JetBrains Mono", size=10),
-                bgcolor="rgba(4,12,20,0.9)",
-                bordercolor="rgba(0,220,255,0.15)",
-                thickness=12,
-                len=0.8,
-            ),
-        ))
-        fig_heat.update_layout(**PLOTLY_LAYOUT, title="Monthly Returns (%)", height=360)
-        st.plotly_chart(fig_heat, use_container_width=True)
-
-    with col_r:
-        daily_returns = df["Close"].resample("D").last().pct_change().dropna() * 100
-        fig_dist = go.Figure()
-        colors_hist = ["#00ff88" if v >= 0 else "#ff3366" for v in daily_returns]
-        fig_dist.add_trace(go.Histogram(
-            x=daily_returns, nbinsx=70,
-            marker=dict(
-                color="#00dcff", opacity=0.7,
-                line=dict(color="rgba(0,220,255,0.1)", width=0.3),
-            ),
-            name="Daily Returns",
-        ))
-        fig_dist.add_vline(x=0,                   line_dash="solid", line_color="rgba(255,255,255,0.15)", line_width=1)
-        fig_dist.add_vline(x=daily_returns.mean(), line_dash="dash",  line_color="#00ff88", line_width=1.5,
-                           annotation_text=f"μ = {daily_returns.mean():.2f}%",
-                           annotation_font=dict(color="#00ff88", family="JetBrains Mono", size=10))
-        fig_dist.update_layout(**PLOTLY_LAYOUT, title="Daily Return Distribution", height=360,
-                               xaxis_title="Return (%)", yaxis_title="Frequency")
-        st.plotly_chart(fig_dist, use_container_width=True)
-
-    section_header("◈", "Buy & Hold Benchmark")
-    bh_curve = (df["Close"] / df["Close"].iloc[0]) * initial_capital
-    bh_final = bh_curve.iloc[-1]
-
-    fig_bh = go.Figure()
-    fig_bh.add_trace(go.Scatter(
-        x=bh_curve.index, y=bh_curve.values,
-        fill="tozeroy",
-        fillcolor="rgba(0,220,255,0.04)",
-        line=dict(color="#00dcff", width=2),
-        name="Buy & Hold",
-    ))
-    fig_bh.add_hline(y=initial_capital, line_dash="dash",
-                     line_color="rgba(255,255,255,0.1)", line_width=1)
-    bh_ret = (bh_final / initial_capital - 1) * 100
-    fig_bh.update_layout(
-        **PLOTLY_LAYOUT, height=240,
-        title=f"Buy & Hold — Initial ${initial_capital:,} → Final ${bh_final:,.0f} ({bh_ret:+.1f}%)",
-        yaxis_title="Value ($)",
-    )
-    st.plotly_chart(fig_bh, use_container_width=True)
+    section_header("📋", "Alerter Activity Logs")
+    
+    if _alerter_state.get("log"):
+        st.dataframe(pd.DataFrame(_alerter_state["log"]), use_container_width=True, hide_index=True)
+    else:
+        st.info("Awaiting live signals... Log is currently empty.")
+        
+    # Manual email dispatchers removed.
 
 # ══════════════════════════════════════════════════════
-#  TAB 2 — PRICE CHART
+# TAB 2: STRATEGY BUILDER
+# ══════════════════════════════════════════════════════
+with tab_strat:
+    section_header("🛠️", "Indicator Configurator")
+    
+    col_ind1, col_ind2 = st.columns([1, 2])
+    with col_ind1:
+        # Add dynamic indicator form
+        st.markdown("##### Add Technical Indicator")
+        ind_type = st.selectbox("Indicator Type", [
+            "SMA", "EMA", "WMA", "HMA", "RSI", "MACD", "Stochastic",
+            "Bollinger", "Keltner", "Donchian", "SuperTrend", "Ichimoku",
+            "ParabolicSAR", "ATR", "StdDev", "OBV", "CMF", "VWAP", "VolumeSMA"
+        ])
+        
+        # Sub inputs based on selection
+        if ind_type in ("SMA", "EMA", "WMA", "HMA", "RSI", "CCI", "MFI", "ROC", "ATR", "StdDev", "Donchian", "CMF", "VolumeSMA"):
+            param_1 = st.number_input("Period (length)", 2, 500, 14)
+        elif ind_type == "MACD":
+            param_1 = st.number_input("Fast Period", 2, 100, 12)
+            param_2 = st.number_input("Slow Period", 5, 200, 26)
+            param_3 = st.number_input("Signal Period", 2, 100, 9)
+        elif ind_type == "Stochastic":
+            param_1 = st.number_input("%K Period", 2, 100, 14)
+            param_2 = st.number_input("%D Period", 2, 100, 3)
+        elif ind_type in ("Bollinger", "Keltner", "SuperTrend"):
+            param_1 = st.number_input("Period (length)", 2, 200, 20 if ind_type != "SuperTrend" else 10)
+            param_2 = st.number_input("Multiplier / Deviation", 0.1, 10.0, 2.0 if ind_type != "SuperTrend" else 3.0, step=0.1)
+        elif ind_type == "Ichimoku":
+            param_1 = st.number_input("Tenkan-sen (Conversion)", 2, 50, 9)
+            param_2 = st.number_input("Kijun-sen (Base)", 5, 100, 26)
+            param_3 = st.number_input("Senkou Span B (Leading B)", 10, 200, 52)
+            param_4 = st.number_input("Lagging Span", 5, 100, 26)
+        elif ind_type == "ParabolicSAR":
+            param_1 = st.number_input("AF Start", 0.001, 0.1, 0.02, format="%.3f")
+            param_2 = st.number_input("AF Step", 0.001, 0.1, 0.02, format="%.3f")
+            param_3 = st.number_input("AF Max", 0.01, 1.0, 0.20, format="%.2f")
+            
+        if st.button("➕ Add Indicator"):
+            config = st.session_state.indicators_config
+            if ind_type in ("SMA", "EMA", "WMA", "HMA", "RSI", "CCI", "MFI", "ROC", "ATR", "StdDev", "Donchian", "CMF", "VolumeSMA"):
+                if ind_type not in config: config[ind_type] = []
+                if param_1 not in config[ind_type]:
+                    config[ind_type].append(int(param_1))
+                    st.rerun()
+            elif ind_type in ("MACD", "Stochastic", "Bollinger", "Keltner", "SuperTrend"):
+                if ind_type not in config: config[ind_type] = []
+                if ind_type in ("Bollinger", "Keltner", "SuperTrend"):
+                    item = [int(param_1), float(param_2)]
+                elif ind_type == "MACD":
+                    item = [int(param_1), int(param_2), int(param_3)]
+                else:
+                    item = [int(param_1), int(param_2)]
+                if item not in config[ind_type]:
+                    config[ind_type].append(item)
+                    st.rerun()
+            elif ind_type == "Ichimoku":
+                if ind_type not in config: config[ind_type] = []
+                item = [int(param_1), int(param_2), int(param_3), int(param_4)]
+                if item not in config[ind_type]:
+                    config[ind_type].append(item)
+                    st.rerun()
+            elif ind_type == "ParabolicSAR":
+                if ind_type not in config: config[ind_type] = []
+                item = [float(param_1), float(param_2), float(param_3)]
+                if item not in config[ind_type]:
+                    config[ind_type].append(item)
+                    st.rerun()
+            elif ind_type in ("OBV", "VWAP"):
+                config[ind_type] = True
+                st.rerun()
+                
+    with col_ind2:
+        st.markdown("##### Configured Indicators")
+        # Render current config list with deletion links
+        ind_list = []
+        for key, val in st.session_state.indicators_config.items():
+            if not val: continue
+            if isinstance(val, list):
+                for v in val:
+                    ind_list.append((key, v))
+            else:
+                ind_list.append((key, val))
+                
+        if not ind_list:
+            st.info("No indicators configured. Add one from the form.")
+        else:
+            for k, v in ind_list:
+                col_i1, col_i2 = st.columns([4, 1])
+                col_i1.markdown(f"<span class='rule-badge'>{k}: {v}</span>", unsafe_allow_html=True)
+                if col_i2.button("Remove", key=f"del_ind_{k}_{v}"):
+                    if isinstance(st.session_state.indicators_config[k], list):
+                        st.session_state.indicators_config[k].remove(v)
+                    else:
+                        st.session_state.indicators_config[k] = False
+                    st.rerun()
+                    
+    st.markdown('<div class="cyber-divider"></div>', unsafe_allow_html=True)
+    section_header("🔬", "Strategy Rule Builder")
+    
+    computed_columns = get_computed_columns(st.session_state.indicators_config)
+    
+    # Form to add rules
+    col_rule1, col_rule2 = st.columns([1, 2])
+    with col_rule1:
+        st.markdown("##### Add Comparison Rule")
+        rule_side = st.selectbox("Side Selection", ["Long Entry", "Long Exit", "Short Entry", "Short Exit"])
+        rule_left = st.selectbox("Left Value / Indicator", computed_columns, key="r_left")
+        rule_op = st.selectbox("Comparison operator", ["crosses_above", "crosses_below", "greater_than", "less_than", "equals"])
+        rule_right_type = st.selectbox("Right Operand Type", ["value", "indicator"])
+        if rule_right_type == "value":
+            rule_right_val = st.number_input("Value", value=50.0, step=1.0)
+            rule_right_ind = None
+        else:
+            rule_right_ind = st.selectbox("Right Indicator", computed_columns, key="r_right_ind")
+            rule_right_val = 0.0
+            
+        if st.button("➕ Add Rule to Strategy"):
+            new_rule = {
+                "indicator1": rule_left,
+                "operator": rule_op,
+                "indicator2_type": rule_right_type,
+                "value": float(rule_right_val) if rule_right_type == "value" else None,
+                "indicator2": rule_right_ind
+            }
+            if rule_side == "Long Entry":
+                st.session_state.long_entry_rules.append(new_rule)
+            elif rule_side == "Long Exit":
+                st.session_state.long_exit_rules.append(new_rule)
+            elif rule_side == "Short Entry":
+                st.session_state.short_entry_rules.append(new_rule)
+            else:
+                st.session_state.short_exit_rules.append(new_rule)
+            st.rerun()
+            
+    with col_rule2:
+        st.markdown("##### Active Strategy Rules")
+        
+        sides_list = [
+            ("Long Entry Conditions", st.session_state.long_entry_rules, "long_entry"),
+            ("Long Exit Conditions (Optional)", st.session_state.long_exit_rules, "long_exit"),
+            ("Short Entry Conditions", st.session_state.short_entry_rules, "short_entry"),
+            ("Short Exit Conditions (Optional)", st.session_state.short_exit_rules, "short_exit")
+        ]
+        
+        for name, rules, prefix in sides_list:
+            st.markdown(f"**{name}**")
+            if not rules:
+                st.markdown("<p style='font-size:12px; color:var(--text-dim); font-style:italic;'>No rules defined. Triggers solely on stop-losses.</p>", unsafe_allow_html=True)
+            else:
+                for idx, r in enumerate(rules):
+                    r_text = f"{r['indicator1']} {r['operator'].replace('_',' ')} "
+                    r_text += str(r['value']) if r['indicator2_type'] == 'value' else str(r['indicator2'])
+                    
+                    col_r1, col_r2 = st.columns([5, 1])
+                    col_r1.markdown(f"<span style='color:var(--cyan); font-family:var(--font-mono); font-size:12px;'>• {r_text}</span>", unsafe_allow_html=True)
+                    if col_r2.button("Remove", key=f"del_rule_{prefix}_{idx}"):
+                        rules.pop(idx)
+                        st.rerun()
+            st.markdown("<br>", unsafe_allow_html=True)
+            
+    # Serialization button
+    st.markdown('<div class="cyber-divider"></div>', unsafe_allow_html=True)
+    if st.button("💾 SAVE STRATEGY TO MONITORING DAEMON", use_container_width=True):
+        strategy_payload = {
+            "timeframe": selected_timeframe,
+            "indicators": st.session_state.indicators_config,
+            "long_entry_rules": st.session_state.long_entry_rules,
+            "long_exit_rules": st.session_state.long_exit_rules,
+            "short_entry_rules": st.session_state.short_entry_rules,
+            "short_exit_rules": st.session_state.short_exit_rules,
+            "risk_pct": risk_pct,
+            "leverage": leverage,
+            "fee": fee_pct,
+            "slippage": slip_pct,
+            "stop_loss_type": stop_loss_type,
+            "stop_loss_val": stop_loss_val,
+            "take_profit_type": take_profit_type,
+            "take_profit_val": take_profit_val,
+            "rr_ratio": rr_ratio
+        }
+        if save_active_strategy_to_disk(strategy_payload):
+            st.success("✓ Strategy compiled, saved, and loaded to active Background Monitoring Alerter!")
+            # Trigger refresh of background alerter loop variables
+        else:
+            st.error("Failed to write strategy file.")
+
+# ══════════════════════════════════════════════════════
+# TAB 3: PRICE CHART
 # ══════════════════════════════════════════════════════
 with tab_chart:
-    section_header("◈", "Interactive OHLCV Chart")
-
-    col_c1, col_c2, col_c3, col_c4 = st.columns(4)
-    show_ema    = col_c1.toggle("Math Dispersion Channel", value=True)
-    show_bb     = col_c2.toggle("Statistical Bounds (2σ)", value=False)
-    show_swings = col_c3.toggle("Visual Swing Points",     value=True)
-    show_volume = col_c4.toggle("Volume Panel",            value=True)
-
-    chart_rows  = 3 if show_volume else 2
-    row_heights = [0.55, 0.25, 0.20] if show_volume else [0.7, 0.3]
-
-    fig = make_subplots(
-        rows=chart_rows, cols=1, shared_xaxes=True,
-        vertical_spacing=0.02, row_heights=row_heights,
-    )
-
-    sample_step = max(1, len(df) // 3000)
-    df_chart    = df.iloc[::sample_step]
-
+    section_header("📈", "Interactive Chart Panels")
+    
+    col_ch1, col_ch2, col_ch3 = st.columns(3)
+    c_trend = col_ch1.multiselect("Trend Overlay Indicators", ["SMA", "EMA", "Bollinger Bands", "SuperTrend", "Ichimoku Cloud", "Parabolic SAR"], default=["SMA", "SuperTrend"])
+    c_osc = col_ch2.selectbox("Oscillator Subplot", ["None", "RSI", "MACD", "Stochastic"], index=1)
+    c_vol = col_ch3.toggle("Volume Panel Overlay", value=True)
+    
+    # Subplot definition
+    num_rows = 1
+    row_heights = [1.0]
+    if c_osc != "None":
+        num_rows += 1
+        row_heights = [0.75, 0.25]
+    if c_vol:
+        num_rows += 1
+        if len(row_heights) == 2:
+            row_heights = [0.65, 0.20, 0.15]
+        else:
+            row_heights = [0.80, 0.20]
+            
+    fig = make_subplots(rows=num_rows, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=row_heights)
+    
+    # Downsample large datasets for chart loading performance
+    step = max(1, len(df_computed) // 1500)
+    df_chart = df_computed.iloc[::step]
+    
+    # Base Candlestick
     fig.add_trace(go.Candlestick(
-        x=df_chart.index,
-        open=df_chart["Open"], high=df_chart["High"],
-        low=df_chart["Low"],   close=df_chart["Close"],
-        increasing_line_color="#00ff88",
-        decreasing_line_color="#ff3366",
-        increasing_fillcolor="rgba(0,255,136,0.7)",
-        decreasing_fillcolor="rgba(255,51,102,0.7)",
-        name="OHLC", showlegend=False,
+        x=df_chart.index, open=df_chart["Open"], high=df_chart["High"],
+        low=df_chart["Low"], close=df_chart["Close"],
+        increasing_line_color="#00ff88", decreasing_line_color="#ff3366",
+        increasing_fillcolor="rgba(0,255,136,0.5)", decreasing_fillcolor="rgba(255,51,102,0.5)",
+        name="OHLC", showlegend=False
     ), row=1, col=1)
+    
+    # Overlays
+    if "SMA" in c_trend and "SMA" in st.session_state.indicators_config:
+        for p in st.session_state.indicators_config["SMA"]:
+            col_name = f"SMA_{p}"
+            if col_name in df_chart.columns:
+                fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart[col_name], line=dict(width=1.2), name=col_name), row=1, col=1)
+                
+    if "EMA" in c_trend and "EMA" in st.session_state.indicators_config:
+        for p in st.session_state.indicators_config["EMA"]:
+            col_name = f"EMA_{p}"
+            if col_name in df_chart.columns:
+                fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart[col_name], line=dict(width=1.2, dash="dash"), name=col_name), row=1, col=1)
+                
+    if "Bollinger" in c_trend and "Bollinger" in st.session_state.indicators_config:
+        for p, dev in st.session_state.indicators_config["Bollinger"]:
+            upper = f"BB_Upper_{p}_{dev}"
+            lower = f"BB_Lower_{p}_{dev}"
+            mid = f"BB_Mid_{p}_{dev}"
+            if upper in df_chart.columns:
+                fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart[upper], line=dict(color="rgba(178,75,255,0.4)", width=1), name=upper), row=1, col=1)
+                fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart[lower], line=dict(color="rgba(178,75,255,0.4)", width=1), name=lower, fill="tonexty", fillcolor="rgba(178,75,255,0.03)"), row=1, col=1)
+                fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart[mid], line=dict(color="rgba(178,75,255,0.2)", width=1, dash="dot"), name=mid), row=1, col=1)
+                
+    if "SuperTrend" in c_trend and "SuperTrend" in st.session_state.indicators_config:
+        for p, mult in st.session_state.indicators_config["SuperTrend"]:
+            st_col = f"SuperTrend_{p}_{mult}"
+            st_dir = f"SuperTrend_Dir_{p}_{mult}"
+            if st_col in df_chart.columns:
+                # Color SuperTrend line dynamically by direction
+                colors = ["#00ff88" if d else "#ff3366" for d in df_chart[st_dir]]
+                fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart[st_col], line=dict(color="#b24bff", width=1.5), name=st_col), row=1, col=1)
+                
+    if "Ichimoku Cloud" in c_trend and "Ichimoku" in st.session_state.indicators_config:
+        for conv, b, lead_b, lag in st.session_state.indicators_config["Ichimoku"]:
+            ten = f"Ichimoku_Tenkan_{conv}"
+            kij = f"Ichimoku_Kijun_{conv}"
+            sa = f"Ichimoku_SpanA_{conv}_{b}"
+            sb = f"Ichimoku_SpanB_{lead_b}"
+            if ten in df_chart.columns:
+                fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart[ten], line=dict(width=1, color="#e6a23c"), name=ten), row=1, col=1)
+                fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart[kij], line=dict(width=1.2, color="#409eff"), name=kij), row=1, col=1)
+                fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart[sa], line=dict(width=1, color="rgba(103,194,58,0.3)"), name=sa), row=1, col=1)
+                fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart[sb], line=dict(width=1, color="rgba(245,108,108,0.3)"), name=sb, fill="tonexty", fillcolor="rgba(255,255,255,0.02)"), row=1, col=1)
+                
+    if "Parabolic SAR" in c_trend and "ParabolicSAR" in st.session_state.indicators_config:
+        for start, step, max_af in st.session_state.indicators_config["ParabolicSAR"]:
+            sar = f"SAR_{start}_{step}_{max_af}"
+            if sar in df_chart.columns:
+                fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart[sar], mode="markers", marker=dict(size=3, color="#909399"), name=sar), row=1, col=1)
 
-    if show_ema:
-        fig.add_trace(go.Scatter(
-            x=df_chart.index, y=df_chart["EMA_Fast"],
-            line=dict(color="#00ff88", width=1.2),
-            name=f"Rolling Price Mean ({fast_span})",
-        ), row=1, col=1)
-        fig.add_trace(go.Scatter(
-            x=df_chart.index, y=df_chart["EMA_Slow"],
-            line=dict(color="#ff3366", width=1.0, dash="dash"),
-            name=f"Upper Breakout Band (+{slow_span}σ)",
-        ), row=1, col=1)
-        fig.add_trace(go.Scatter(
-            x=df_chart.index, y=df_chart["EMA_Trend"],
-            line=dict(color="#ff3366", width=1.0, dash="dash"),
-            name=f"Lower Breakout Band (-{slow_span}σ)",
-        ), row=1, col=1)
+    # Oscillator Subplot
+    osc_row = 2
+    if c_osc == "RSI" and "RSI" in st.session_state.indicators_config:
+        for p in st.session_state.indicators_config["RSI"]:
+            col_name = f"RSI_{p}"
+            if col_name in df_chart.columns:
+                fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart[col_name], line=dict(color="#b24bff", width=1.5), name=col_name), row=osc_row, col=1)
+                fig.add_hline(y=70, line_dash="dash", line_color="#ff3366", line_width=1, row=osc_row, col=1)
+                fig.add_hline(y=30, line_dash="dash", line_color="#00ff88", line_width=1, row=osc_row, col=1)
+                fig.add_hline(y=50, line_dash="dot", line_color="rgba(255,255,255,0.15)", line_width=1, row=osc_row, col=1)
+                fig.update_yaxes(range=[0, 100], row=osc_row, col=1)
+                
+    elif c_osc == "MACD" and "MACD" in st.session_state.indicators_config:
+        for fast, slow, sig in st.session_state.indicators_config["MACD"]:
+            m_line = f"MACD_Line_{fast}_{slow}_{sig}"
+            s_line = f"MACD_Signal_{fast}_{slow}_{sig}"
+            hist = f"MACD_Hist_{fast}_{slow}_{sig}"
+            if m_line in df_chart.columns:
+                fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart[m_line], line=dict(color="#00dcff", width=1.2), name=m_line), row=osc_row, col=1)
+                fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart[s_line], line=dict(color="#ff8c00", width=1.2), name=s_line), row=osc_row, col=1)
+                fig.add_trace(go.Bar(x=df_chart.index, y=df_chart[hist], marker_color="rgba(0,220,255,0.4)", name=hist), row=osc_row, col=1)
+                
+    elif c_osc == "Stochastic" and "Stochastic" in st.session_state.indicators_config:
+        for kp, dp in st.session_state.indicators_config["Stochastic"]:
+            k = f"Stoch_K_{kp}_{dp}"
+            d = f"Stoch_D_{kp}_{dp}"
+            if k in df_chart.columns:
+                fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart[k], line=dict(color="#00ff88", width=1.2), name=k), row=osc_row, col=1)
+                fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart[d], line=dict(color="#ff3366", width=1.2, dash="dash"), name=d), row=osc_row, col=1)
+                fig.add_hline(y=80, line_dash="dash", line_color="#ff3366", line_width=1, row=osc_row, col=1)
+                fig.add_hline(y=20, line_dash="dash", line_color="#00ff88", line_width=1, row=osc_row, col=1)
+                fig.update_yaxes(range=[0, 100], row=osc_row, col=1)
 
-    if show_bb:
-        for band, color, dash, name in [
-            ("BB_upper", "rgba(178,75,255,0.7)", "dot",  "Upper Bound (+2σ)"),
-            ("BB_lower", "rgba(178,75,255,0.7)", "dot",  "Lower Bound (-2σ)"),
-            ("BB_mid",   "rgba(178,75,255,0.4)", "dash", "Rolling Mean"),
-        ]:
-            fig.add_trace(go.Scatter(
-                x=df_chart.index, y=df_chart[band],
-                line=dict(color=color, width=1, dash=dash),
-                name=name,
-            ), row=1, col=1)
-
-    if show_swings:
-        sh_s, sl_s = swings(df_chart, 7)
-        fig.add_trace(go.Scatter(
-            x=df_chart[sh_s].index, y=df_chart[sh_s]["High"] * 1.002,
-            mode="markers",
-            marker=dict(symbol="triangle-down", color="#ff3366", size=7,
-                        line=dict(color="rgba(255,51,102,0.3)", width=1)),
-            name="Swing High",
-        ), row=1, col=1)
-        fig.add_trace(go.Scatter(
-            x=df_chart[sl_s].index, y=df_chart[sl_s]["Low"] * 0.998,
-            mode="markers",
-            marker=dict(symbol="triangle-up", color="#00ff88", size=7,
-                        line=dict(color="rgba(0,255,136,0.3)", width=1)),
-            name="Swing Low",
-        ), row=1, col=1)
-
-    # Z-Score Panel (represented as normalized Z on [0, 100] scale, where Z-score of 0 is 50)
-    fig.add_trace(go.Scatter(
-        x=df_chart.index, y=df_chart["RSI"],
-        line=dict(color="#b24bff", width=1.5), name="Z-Score (scaled)",
-    ), row=2, col=1)
-    # Highlight statistical outlier zones (Z > 1.2 or Z < -1.2, i.e. RSI > 65 or RSI < 35)
-    fig.add_hrect(y0=65, y1=100, fillcolor="rgba(0,255,136,0.06)",  line_width=0, row=2, col=1)
-    fig.add_hrect(y0=0,  y1=35,  fillcolor="rgba(255,51,102,0.06)",   line_width=0, row=2, col=1)
-    fig.add_hline(y=65, line_dash="dot", line_color="rgba(0,255,136,0.4)",  line_width=1, row=2, col=1, annotation_text="+Z Threshold")
-    fig.add_hline(y=35, line_dash="dot", line_color="rgba(255,51,102,0.4)",   line_width=1, row=2, col=1, annotation_text="-Z Threshold")
-    fig.add_hline(y=50, line_dash="solid", line_color="rgba(255,255,255,0.12)", line_width=1, row=2, col=1, annotation_text="Mean (Z=0)")
-
-    if show_volume:
-        colors_vol = [
-            "rgba(0,255,136,0.5)" if c >= o else "rgba(255,51,102,0.5)"
-            for c, o in zip(df_chart["Close"], df_chart["Open"])
-        ]
-        fig.add_trace(go.Bar(
-            x=df_chart.index, y=df_chart["Volume"],
-            marker_color=colors_vol, name="Volume",
-        ), row=3, col=1)
-
-    fig.update_layout(
-        **PLOTLY_LAYOUT, height=720,
-        title=f"BTC/USDT — 4H Statistical Detrended Analysis · {date_start} → {date_end}",
-        xaxis_rangeslider_visible=False,
-    )
+    # Volume Subplot
+    vol_row = 3 if c_osc != "None" else 2
+    if c_vol:
+        colors_vol = ["rgba(0,255,136,0.65)" if c >= o else "rgba(255,51,102,0.65)"
+                      for c, o in zip(df_chart["Close"], df_chart["Open"])]
+        fig.add_trace(go.Bar(x=df_chart.index, y=df_chart["Volume"], marker_color=colors_vol, name="Volume"), row=vol_row, col=1)
+        
+    fig.update_layout(**PLOTLY_LAYOUT, height=750, title="BTC/USDT Candlestick Analysis Panel", xaxis_rangeslider_visible=False)
     fig.update_yaxes(title_text="Price (USD)", row=1, col=1)
-    fig.update_yaxes(title_text="Z-Score (0-100 scale)", row=2, col=1, range=[0, 100])
-    if show_volume:
-        fig.update_yaxes(title_text="Volume",  row=3, col=1)
+    if c_osc != "None":
+        fig.update_yaxes(title_text=c_osc, row=osc_row, col=1)
+    if c_vol:
+        fig.update_yaxes(title_text="Volume", row=vol_row, col=1)
+        
     st.plotly_chart(fig, use_container_width=True)
 
-    cyber_divider()
-    section_header("◈", "Standard Deviation — Volatility Regime")
-    fig_atr = go.Figure()
-    fig_atr.add_trace(go.Scatter(
-        x=df_chart.index, y=df_chart["ATR"],
-        fill="tozeroy", fillcolor="rgba(178,75,255,0.06)",
-        line=dict(color="#b24bff", width=1.5), name="Std Dev (σ)",
-    ))
-    fig_atr.add_hline(
-        y=df["ATR"].median(), line_dash="dash",
-        line_color="rgba(0,220,255,0.5)", line_width=1.2,
-        annotation_text="Median Volatility",
-        annotation_font=dict(color="#00dcff", family="JetBrains Mono", size=10),
-    )
-    fig_atr.update_layout(**PLOTLY_LAYOUT, height=200, yaxis_title="Price Std Dev (σ) ($)")
-    st.plotly_chart(fig_atr, use_container_width=True)
-
 # ══════════════════════════════════════════════════════
-#  TAB 3 — BACKTEST
+# TAB 4: BACKTEST REPORT
 # ══════════════════════════════════════════════════════
-with tab_backtest:
-    section_header("◈", "Single Strategy Backtest")
-    st.markdown(f"""
-    <div class="info-box">
-      <b>Parameters:</b> Math Window={fast_span} · Z Threshold={slow_span} · Volatility Stop={atr_mult} · Risk={risk_pct}% · RR={rr} ·
-      Capital=<b>${initial_capital:,}</b> · Leverage={max_leverage}× ·
-      Fee={fee*100:.2f}% · Slippage={slippage*100:.2f}%
-    </div>""", unsafe_allow_html=True)
-
-    # Run immediately on page load OR on button click
-    _run = run_btn or ("last_result" not in st.session_state)
-    if _run:
-        with st.spinner("Computing backtest…"):
-            result = backtest(
-                df, fast_span, risk_pct, rr, initial_capital,
-                max_leverage, fee, slippage, max_dd_pct / 100,
-                slow_span=slow_span, trend_span=trend_span, atr_mult=atr_mult, detailed=True,
+with tab_back:
+    section_header("🔬", "Backtest Simulation Engine")
+    
+    # Run backtest automatically on button or state change
+    _run_engine = run_backtest_btn or ("backtest_results" not in st.session_state)
+    
+    if _run_engine:
+        with st.spinner("Executing backtest simulation..."):
+            res = backtester.run_backtest(
+                df_computed, initial_capital, risk_pct, leverage,
+                fee_pct/100, slip_pct/100, max_drawdown_limit,
+                st.session_state.long_entry_rules, st.session_state.long_exit_rules,
+                st.session_state.short_entry_rules, st.session_state.short_exit_rules,
+                stop_loss_type, stop_loss_val, take_profit_type, take_profit_val, rr_ratio,
+                timeframe=selected_timeframe
             )
-        if result is not None:
-            st.session_state["last_result"] = result
-        elif run_btn:
-            st.error("⚠️ Backtest stopped — max drawdown exceeded or < 10 trades. Adjust parameters.")
-
-    result = st.session_state.get("last_result")
-
-    if result:
-        pf_val = (
-            (result["WinRate"] / 100 * result["RR"]) / (1 - result["WinRate"] / 100)
-            if result["WinRate"] < 100 else 99
-        )
-        bh_ret_bt = (df["Close"].iloc[-1] / df["Close"].iloc[0] - 1) * 100
-        alpha     = result["Return%"] - bh_ret_bt
-
-        c1,c2,c3,c4,c5,c6,c7 = st.columns(7)
-        for col, label, val, sub, clr in [
-            (c1, "Total Return",   f"{result['Return%']:+.2f}%",   f"${result['FinalCapital']:,.0f} final",  "positive" if result["Return%"]>0 else "negative"),
-            (c2, "vs Buy & Hold", f"{alpha:+.1f}%",                "Alpha generated",                        "positive" if alpha>0 else "negative"),
-            (c3, "Win Rate",      f"{result['WinRate']:.1f}%",     f"{result['Trades']} trades",             "positive" if result["WinRate"]>50 else "negative"),
-            (c4, "Max Drawdown",  f"{result['MaxDD%']:.2f}%",      "Peak-to-trough",                         "negative"),
-            (c5, "Expectancy",    f"{result['Expectancy']:.3f}R",  "Avg R per trade",                        "positive" if result["Expectancy"]>0 else "negative"),
-            (c6, "Profit Factor", f"{pf_val:.2f}",                 "Win×RR / Losses",                        "positive" if pf_val>1 else "negative"),
-            (c7, "Sharpe Proxy",  f"{(result['Return%']/max(result['MaxDD%'],0.01)):.2f}", "Return/MDD",     "positive"),
-        ]:
-            with col:
-                st.markdown(metric_card(label, val, sub, clr), unsafe_allow_html=True)
-
+            st.session_state.backtest_results = res
+            st.session_state.pop("mc_simulations", None) # clear old simulation curves
+            
+    res = st.session_state.get("backtest_results")
+    
+    if res is None:
+        st.error("⚠️ Backtest aborted: strategy exceeded maximum drawdown tolerance limit, or no trades were executed.")
+    else:
+        # Display Metrics Cards
+        c_m1, c_m2, c_m3, c_m4, c_m5, c_m6, c_m7 = st.columns(7)
+        with c_m1:
+            st.markdown(metric_card("Net Return", f"{res['Return%']:+.2f}%", f"${res['FinalCapital']:,.2f} final", "positive" if res["Return%"] >= 0 else "negative"), unsafe_allow_html=True)
+        with c_m2:
+            st.markdown(metric_card("Win Rate", f"{res['WinRate']:.1f}%", f"{res['Trades']} trades", "positive" if res["WinRate"] >= 50.0 else "negative"), unsafe_allow_html=True)
+        with c_m3:
+            st.markdown(metric_card("Max Drawdown", f"{res['MaxDD%']:.2f}%", "Peak-to-trough", "negative" if res["MaxDD%"] > 15.0 else "neutral"), unsafe_allow_html=True)
+        with c_m4:
+            st.markdown(metric_card("Profit Factor", f"{res['ProfitFactor']:.2f}", "Wins / Losses", "positive" if res["ProfitFactor"] > 1.0 else "negative"), unsafe_allow_html=True)
+        with c_m5:
+            st.markdown(metric_card("Sharpe Ratio", f"{res['SharpeProxy']:.2f}", "Annualized", "positive" if res["SharpeProxy"] > 1.0 else "neutral"), unsafe_allow_html=True)
+        with c_m6:
+            st.markdown(metric_card("Sortino Ratio", f"{res['SortinoProxy']:.2f}", "Downside risk", "positive" if res["SortinoProxy"] > 1.0 else "neutral"), unsafe_allow_html=True)
+        with c_m7:
+            st.markdown(metric_card("Expectancy", f"{res['Expectancy']:+.2f} R", "Average profit", "positive" if res["Expectancy"] > 0 else "negative"), unsafe_allow_html=True)
+            
         st.markdown("<br>", unsafe_allow_html=True)
-
-        # Equity Curve
-        eq_times  = [e[0] for e in result["equity_curve"]]
-        eq_values = [e[1] for e in result["equity_curve"]]
-        eq_series = pd.Series(eq_values, index=eq_times)
-        # Drop duplicate timestamps (keep last value per bar)
-        eq_series = eq_series[~eq_series.index.duplicated(keep="last")]
-        roll_max  = eq_series.expanding().max()
-        drawdown  = (roll_max - eq_series) / roll_max * 100
-
-        fig_eq = make_subplots(rows=2, cols=1, shared_xaxes=True,
-                               vertical_spacing=0.03, row_heights=[0.65, 0.35])
-        fig_eq.add_trace(go.Scatter(
-            x=eq_series.index, y=eq_series.values,
-            fill="tozeroy", fillcolor="rgba(0,255,136,0.05)",
-            line=dict(color="#00ff88", width=2), name="Strategy Equity",
-        ), row=1, col=1)
-        # Buy & Hold overlay
-        bh_eq = (df["Close"] / df["Close"].iloc[0]) * initial_capital
-        # Safe alignment: drop duplicate timestamps, then forward-fill onto equity curve index
-        bh_eq_clean = bh_eq[~bh_eq.index.duplicated(keep="last")]
-        eq_idx_clean = pd.Index(eq_times).drop_duplicates(keep="last")
-        bh_eq_aligned = bh_eq_clean.reindex(
-            bh_eq_clean.index.union(eq_idx_clean)
-        ).interpolate(method="time").reindex(eq_idx_clean)
-        fig_eq.add_trace(go.Scatter(
-            x=eq_idx_clean, y=bh_eq_aligned.values,
-            line=dict(color="rgba(0,220,255,0.35)", width=1.2, dash="dot"),
-            name="Buy & Hold",
-        ), row=1, col=1)
-        fig_eq.add_hline(
-            y=initial_capital, line_dash="dash",
-            line_color="rgba(255,255,255,0.1)", line_width=1,
-            row=1, col=1,
-        )
-        fig_eq.add_trace(go.Scatter(
-            x=drawdown.index, y=-drawdown.values,
-            fill="tozeroy", fillcolor="rgba(255,51,102,0.1)",
-            line=dict(color="#ff3366", width=1.5), name="Drawdown",
-        ), row=2, col=1)
-        fig_eq.update_layout(**PLOTLY_LAYOUT, height=520, title="Equity Curve vs Buy & Hold")
-        fig_eq.update_yaxes(title_text="Portfolio ($)", row=1)
-        fig_eq.update_yaxes(title_text="Drawdown (%)", row=2)
+        section_header("📉", "Equity Curve Growth")
+        
+        # Build DataFrame for Equity plot
+        eq_data = pd.DataFrame(res["equity_curve"], columns=["time", "value"]).set_index("time")
+        eq_data = eq_data[~eq_data.index.duplicated(keep="last")]
+        
+        # Buy & Hold calculation for benchmark
+        bh_series = (df_computed["Close"] / df_computed["Close"].iloc[0]) * initial_capital
+        bh_series = bh_series[~bh_series.index.duplicated(keep="last")]
+        
+        # Merge series to align index
+        plot_df = pd.DataFrame(index=eq_data.index.union(bh_series.index))
+        plot_df["Strategy"] = eq_data["value"]
+        plot_df["BuyHold"] = bh_series
+        plot_df = plot_df.interpolate(method="time").ffill().bfill().loc[eq_data.index]
+        
+        fig_eq = go.Figure()
+        fig_eq.add_trace(go.Scatter(x=plot_df.index, y=plot_df["Strategy"], fill="tozeroy", fillcolor="rgba(0,255,136,0.03)", line=dict(color="#00ff88", width=2), name="Strategy Equity"))
+        fig_eq.add_trace(go.Scatter(x=plot_df.index, y=plot_df["BuyHold"], line=dict(color="rgba(0,220,255,0.3)", width=1.2, dash="dot"), name="Buy & Hold Benchmark"))
+        fig_eq.update_layout(**PLOTLY_LAYOUT, height=420, yaxis_title="Account Balance ($)")
         st.plotly_chart(fig_eq, use_container_width=True)
 
-        if result.get("trade_records"):
-            trades_df = pd.DataFrame(result["trade_records"])
-            col_p1, col_p2 = st.columns(2)
-
-            with col_p1:
-                section_header("◈", "PnL Distribution")
-                avg_win  = trades_df[trades_df["pnl_currency"] > 0]["pnl_currency"].mean()
-                avg_loss = trades_df[trades_df["pnl_currency"] < 0]["pnl_currency"].mean()
-                fig_pnl  = go.Figure()
-                fig_pnl.add_trace(go.Histogram(
-                    x=trades_df["pnl_currency"], nbinsx=40,
-                    marker=dict(
-                        color=["rgba(0,255,136,0.7)" if v > 0 else "rgba(255,51,102,0.7)"
-                               for v in trades_df["pnl_currency"]],
-                        line=dict(color="rgba(0,0,0,0.2)", width=0.5),
-                    ),
-                ))
-                fig_pnl.add_vline(x=0,        line_dash="solid", line_color="rgba(255,255,255,0.1)")
-                fig_pnl.add_vline(x=avg_win,  line_dash="dash",  line_color="#00ff88",
-                                  annotation_text=f"Avg Win ${avg_win:,.0f}",
-                                  annotation_font=dict(color="#00ff88", family="JetBrains Mono", size=10))
-                if not np.isnan(avg_loss):
-                    fig_pnl.add_vline(x=avg_loss, line_dash="dash", line_color="#ff3366",
-                                      annotation_text=f"Avg Loss ${avg_loss:,.0f}",
-                                      annotation_font=dict(color="#ff3366", family="JetBrains Mono", size=10))
-                fig_pnl.update_layout(**PLOTLY_LAYOUT, height=300,
-                                      xaxis_title="PnL ($)", yaxis_title="Frequency")
-                st.plotly_chart(fig_pnl, use_container_width=True)
-
-            with col_p2:
-                section_header("◈", "Cumulative PnL")
-                cum_pnl = trades_df["pnl_currency"].cumsum()
-                final_col = "#00ff88" if cum_pnl.iloc[-1] >= 0 else "#ff3366"
-                fig_cum = go.Figure()
-                fig_cum.add_trace(go.Scatter(
-                    x=list(range(len(cum_pnl))), y=cum_pnl.values,
-                    line=dict(color=final_col, width=2),
-                    fill="tozeroy",
-                    fillcolor=f"rgba({'0,255,136' if cum_pnl.iloc[-1]>=0 else '255,51,102'},0.08)",
-                ))
-                fig_cum.add_hline(y=0, line_dash="dash", line_color="rgba(255,255,255,0.1)")
-                fig_cum.update_layout(**PLOTLY_LAYOUT, height=300,
-                                      xaxis_title="Trade #", yaxis_title="Cumulative PnL ($)")
-                st.plotly_chart(fig_cum, use_container_width=True)
-
-            section_header("◈", "Long vs Short Breakdown")
-            by_type = trades_df.groupby("type").agg(
-                Trades   =("pnl_currency", "count"),
-                Total_PnL=("pnl_currency", "sum"),
-                Avg_PnL  =("pnl_currency", "mean"),
-                Win_Rate =("pnl_currency", lambda x: (x > 0).mean() * 100),
-            ).reset_index()
-            col_t1, col_t2 = st.columns([1, 2])
-            with col_t1:
-                st.dataframe(
-                    by_type.style.format({
-                        "Total_PnL": "${:.2f}", "Avg_PnL": "${:.2f}", "Win_Rate": "{:.1f}%",
-                    }),
-                    use_container_width=True, hide_index=True,
-                )
-            with col_t2:
-                fig_type = go.Figure(go.Bar(
-                    x=by_type["type"], y=by_type["Total_PnL"],
-                    marker=dict(
-                        color=["rgba(0,255,136,0.7)" if v > 0 else "rgba(255,51,102,0.7)"
-                               for v in by_type["Total_PnL"]],
-                        line=dict(color="rgba(0,220,255,0.2)", width=1),
-                    ),
-                ))
-                fig_type.update_layout(**PLOTLY_LAYOUT, height=220)
-                st.plotly_chart(fig_type, use_container_width=True)
-
 # ══════════════════════════════════════════════════════
-#  TAB 4 — OPTIMIZER
+# TAB 5: PARAMETER GRID SEARCH OPTIMIZER
 # ══════════════════════════════════════════════════════
-with tab_optimizer:
-    section_header("◈", "Parameter Grid Search")
-
-    if not risk_options or not rr_options:
-        st.warning("Select at least one Risk% and one RR value in the sidebar.")
-    else:
-        n_combos = (fast_range[1] - fast_range[0] + 1) * len(risk_options) * len(rr_options)
-        st.markdown(f"""
-        <div class="info-box">
-          Testing <b>{n_combos}</b> combinations —
-          Math Window Range {fast_range[0]}–{fast_range[1]} ·
-          Risk {risk_options} ·
-          RR {rr_options}
-        </div>""", unsafe_allow_html=True)
-
-        if opt_btn:
-            progress    = st.progress(0)
-            status      = st.empty()
-            opt_results = []
-            done        = 0
-
-            for sw in range(fast_range[0], fast_range[1] + 1):
-                for rk in risk_options:
-                    for rv in rr_options:
-                        res = backtest(
-                            df, sw, rk, rv, initial_capital,
-                            max_leverage, fee, slippage, max_dd_pct / 100,
-                            slow_span=slow_span, trend_span=trend_span, atr_mult=atr_mult, detailed=False,
-                        )
-                        if res:
-                            opt_results.append({
-                                "Swing":        sw,
-                                "Risk%":        rk,
-                                "RR":           rv,
-                                "Return%":      round(res["Return%"],  2),
-                                "WinRate":      round(res["WinRate"],  2),
-                                "MaxDD%":       round(res["MaxDD%"],   2),
-                                "Expectancy":   round(res["Expectancy"], 4),
-                                "Trades":       res["Trades"],
-                                "FinalCapital": round(res["FinalCapital"], 2),
-                            })
-                        done += 1
-                        progress.progress(done / n_combos)
-                        status.markdown(
-                            f'<div class="info-box">Testing Math Window={sw} · Risk={rk}% · RR={rv} — {done}/{n_combos}</div>',
-                            unsafe_allow_html=True,
-                        )
-
-            progress.empty(); status.empty()
-            if opt_results:
-                st.session_state["opt_results"] = (
-                    pd.DataFrame(opt_results).sort_values("Return%", ascending=False)
-                )
-
-        if "opt_results" in st.session_state:
-            df_opt = st.session_state["opt_results"]
-            st.success(f"✓ {len(df_opt)} valid configs found out of {n_combos} tested")
-
-            section_header("◈", "Top 10 Configurations")
-            st.dataframe(
-                df_opt.head(10).style
-                    .background_gradient(subset=["Return%"], cmap="RdYlGn")
-                    .background_gradient(subset=["MaxDD%"],  cmap="RdYlGn_r")
-                    .background_gradient(subset=["WinRate"], cmap="RdYlGn")
-                    .format({
-                        "Return%": "{:.2f}%", "WinRate": "{:.1f}%",
-                        "MaxDD%": "{:.2f}%",  "FinalCapital": "${:,.0f}",
-                    }),
-                use_container_width=True, hide_index=True,
-            )
-
-            section_header("◈", "Return vs Drawdown Scatter")
-            fig_scatter = px.scatter(
-                df_opt, x="MaxDD%", y="Return%", color="WinRate",
-                size="Trades", hover_data=["Swing", "Risk%", "RR", "Expectancy"],
-                color_continuous_scale=[
-                    [0, "#ff3366"], [0.4, "#ff8c00"], [0.6, "#ff8c00"], [1, "#00ff88"]
-                ],
-            )
-            fig_scatter.update_layout(
-                **PLOTLY_LAYOUT, height=440,
-                title="Return % vs Max Drawdown% — bubble = # trades",
-                coloraxis_colorbar=dict(
-                    title="Win Rate %",
-                    tickfont=dict(color="#7aa0c0", family="JetBrains Mono", size=10),
-                ),
-            )
-            st.plotly_chart(fig_scatter, use_container_width=True)
-
-            section_header("◈", "Heatmap: Swing × RR")
-            best_per = df_opt.groupby(["Swing","RR"])["Return%"].max().reset_index()
-            pivot_h  = best_per.pivot(index="Swing", columns="RR", values="Return%")
-            fig_hm   = go.Figure(go.Heatmap(
-                z=pivot_h.values,
-                x=[f"RR {v}" for v in pivot_h.columns],
-                y=[f"Swing {v}" for v in pivot_h.index],
-                colorscale=[
-                    [0.0, "#ff3366"], [0.4, "#220010"],
-                    [0.5, "#071020"],
-                    [0.6, "#002210"], [1.0, "#00ff88"],
-                ],
-                text=[[f"{v:.1f}%" if not np.isnan(v) else "—" for v in row] for row in pivot_h.values],
-                texttemplate="%{text}",
-                textfont={"size": 11, "family": "JetBrains Mono"},
-                zmid=0,
-                colorbar=dict(
-                    tickfont=dict(color="#7aa0c0", family="JetBrains Mono", size=10),
-                ),
-            ))
-            fig_hm.update_layout(**PLOTLY_LAYOUT, height=340, title="Max Return (%) by Swing × RR")
-            st.plotly_chart(fig_hm, use_container_width=True)
-
-            st.download_button(
-                "⬇  EXPORT RESULTS (CSV)",
-                df_opt.to_csv(index=False).encode(),
-                "optimization_results.csv", "text/csv",
-                use_container_width=True,
-            )
+with tab_opt:
+    section_header("⚡", "Backtest Parameter Grid Search")
+    
+    st.markdown("""
+    <div class="info-box">
+      Sweep across different <b>Risk%</b> and <b>Reward-to-Risk (R)</b> values to optimize position sizing and exits.
+    </div>
+    """, unsafe_allow_html=True)
+    
+    col_op1, col_op2 = st.columns(2)
+    risk_options = col_op1.multiselect("Risk Options (%)", [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0], default=[1.0, 1.5, 2.0])
+    rr_options = col_op2.multiselect("R-to-Risk Options (R)", [1.5, 2.0, 2.5, 3.0, 4.0, 5.0], default=[2.0, 3.0, 4.0])
+    
+    run_opt_btn = st.button("⚡ Start Parameter Optimization Sweeping")
+    
+    if run_opt_btn:
+        if not risk_options or not rr_options:
+            st.warning("Please choose at least one Risk% option and one RR option.")
         else:
-            st.markdown("""
-            <div class="info-box">
-              Click <b>⚡ OPTIMIZE PARAMS</b> in the sidebar to start the grid search.
-            </div>""", unsafe_allow_html=True)
+            opt_runs = len(risk_options) * len(rr_options)
+            p_bar = st.progress(0.0)
+            status_text = st.empty()
+            opt_data = []
+            
+            completed = 0
+            for rk in risk_options:
+                for rv in rr_options:
+                    status_text.markdown(f"Running simulation for Risk={rk}%, RR={rv}...")
+                    ores = backtester.run_backtest(
+                        df_computed, initial_capital, rk, leverage,
+                        fee_pct/100, slip_pct/100, max_drawdown_limit,
+                        st.session_state.long_entry_rules, st.session_state.long_exit_rules,
+                        st.session_state.short_entry_rules, st.session_state.short_exit_rules,
+                        stop_loss_type, stop_loss_val, take_profit_type, take_profit_val, rv,
+                        timeframe=selected_timeframe
+                    )
+                    
+                    if ores:
+                        opt_data.append({
+                            "Risk%": rk,
+                            "RR": rv,
+                            "Return%": round(ores["Return%"], 2),
+                            "WinRate": round(ores["WinRate"], 1),
+                            "MaxDD%": round(ores["MaxDD%"], 2),
+                            "Sharpe": round(ores["SharpeProxy"], 2),
+                            "Trades": ores["Trades"],
+                        })
+                    completed += 1
+                    p_bar.progress(completed / opt_runs)
+                    
+            p_bar.empty()
+            status_text.empty()
+            
+            if opt_data:
+                st.session_state.opt_results = pd.DataFrame(opt_data).sort_values("Return%", ascending=False)
+                st.success(f"✓ Sweep complete! Tested {completed} parameter sets successfully.")
+            else:
+                st.error("All parameter optimization runs failed. Try widening limits.")
+                
+    if "opt_results" in st.session_state:
+        df_opt = st.session_state.opt_results
+        
+        st.markdown("##### Top Optimized Configurations")
+        st.dataframe(
+            df_opt.head(10).style
+                .background_gradient(subset=["Return%"], cmap="RdYlGn")
+                .background_gradient(subset=["MaxDD%"], cmap="RdYlGn_r")
+                .format({"Return%": "{:.2f}%", "MaxDD%": "{:.2f}%", "WinRate": "{:.1f}%"}),
+            use_container_width=True, hide_index=True
+        )
+        
+        st.markdown("<br>", unsafe_allow_html=True)
+        # Heatmap
+        best_pivot = df_opt.pivot_table(values="Return%", index="Risk%", columns="RR")
+        
+        fig_hm = go.Figure(go.Heatmap(
+            z=best_pivot.values,
+            x=[f"RR: {x}" for x in best_pivot.columns],
+            y=[f"Risk: {y}%" for y in best_pivot.index],
+            colorscale="RdYlGn",
+            text=[[f"{v:+.1f}%" if not np.isnan(v) else "—" for v in row] for row in best_pivot.values],
+            texttemplate="%{text}",
+            zmid=0
+        ))
+        fig_hm.update_layout(**PLOTLY_LAYOUT, height=340, title="Return% Heatmap by Risk% vs Reward/Risk R Ratio")
+        st.plotly_chart(fig_hm, use_container_width=True)
 
 # ══════════════════════════════════════════════════════
-#  TAB 5 — MONTE CARLO
+# TAB 6: MONTE CARLO STRESS TEST
 # ══════════════════════════════════════════════════════
 with tab_mc:
-    section_header("◈", "Monte Carlo Risk Simulation")
-
-    if "last_result" not in st.session_state:
-        st.markdown("""
-        <div class="info-box">Run the backtest first (Tab 3) to enable Monte Carlo simulation.</div>
-        """, unsafe_allow_html=True)
+    section_header("🎲", "Monte Carlo Risk Analysis")
+    
+    if res is None or not res.get("R_List"):
+        st.warning("Please run a valid backtest (Tab 4) to populate returns for Monte Carlo simulation.")
     else:
-        r      = st.session_state["last_result"]
-        R_list = r["R_List"]
-
-        if len(R_list) < 5:
-            st.warning("Not enough trades for a meaningful simulation.")
-        else:
-            col_mc1, col_mc2 = st.columns([1, 2])
-            with col_mc1:
-                st.markdown(f"""
-                <div class="info-box">
-                  <b>Setup</b><br>
-                  Trades sampled: {len(R_list)}<br>
-                  Simulations: {mc_runs:,}<br>
-                  Risk per trade: {risk_pct}%<br>
-                  Method: Bootstrap w/ replacement
-                </div>""", unsafe_allow_html=True)
-                mc_btn = st.button("▶  Run Monte Carlo", use_container_width=True)
-            with col_mc2:
-                st.markdown("""
-                <div class="info-box">
-                  Monte Carlo resamples historical trade R-multiples thousands of times in random order
-                  to estimate the distribution of possible outcomes — stress-testing the strategy
-                  against sequence-of-returns risk. Green = profitable outcomes, red = below initial capital.
-                </div>""", unsafe_allow_html=True)
-
-            if mc_btn or "mc_curves" in st.session_state:
-                if mc_btn:
-                    with st.spinner(f"Running {mc_runs:,} simulations…"):
-                        curves = monte_carlo(R_list, initial_capital, risk_pct, mc_runs)
-                    st.session_state["mc_curves"] = curves
-
-                curves    = st.session_state["mc_curves"]
-                p5        = np.percentile(curves, 5)
-                p25       = np.percentile(curves, 25)
-                med       = np.median(curves)
-                p75       = np.percentile(curves, 75)
-                p95       = np.percentile(curves, 95)
-                prob_loss = sum(1 for c in curves if c < initial_capital) / len(curves) * 100
-
-                c1,c2,c3,c4,c5,c6 = st.columns(6)
-                for col, label, val, sub, clr in [
-                    (c1, "5th Pctile",  f"${p5:,.0f}",      "Worst 5%",      "negative"),
-                    (c2, "25th Pctile", f"${p25:,.0f}",     "Bear case",     "negative"),
-                    (c3, "Median",      f"${med:,.0f}",     "Base case",     "neutral"),
-                    (c4, "75th Pctile", f"${p75:,.0f}",     "Bull case",     "positive"),
-                    (c5, "95th Pctile", f"${p95:,.0f}",     "Best 5%",       "positive"),
-                    (c6, "Loss Prob.",  f"{prob_loss:.1f}%","Below initial", "negative" if prob_loss>20 else "positive"),
-                ]:
-                    with col:
-                        st.markdown(metric_card(label, val, sub, clr), unsafe_allow_html=True)
-
-                st.markdown("<br>", unsafe_allow_html=True)
-                col_mca, col_mcb = st.columns(2)
-
-                with col_mca:
-                    fig_mch = go.Figure()
-                    bin_colors = ["rgba(255,51,102,0.6)" if c < initial_capital else "rgba(0,255,136,0.6)"
-                                  for c in curves]
-                    fig_mch.add_trace(go.Histogram(
-                        x=curves, nbinsx=60,
-                        marker=dict(color="#00dcff", opacity=0.65,
-                                    line=dict(color="rgba(0,0,0,0.2)", width=0.3)),
-                    ))
-                    fig_mch.add_vline(x=initial_capital, line_dash="dash",
-                                      line_color="rgba(255,255,255,0.2)", line_width=1.5,
-                                      annotation_text="Initial",
-                                      annotation_font=dict(color="#ffffff", family="JetBrains Mono", size=10))
-                    fig_mch.add_vline(x=med, line_dash="dash", line_color="#00ff88", line_width=1.5,
-                                      annotation_text=f"Median ${med:,.0f}",
-                                      annotation_font=dict(color="#00ff88", family="JetBrains Mono", size=10))
-                    fig_mch.update_layout(**PLOTLY_LAYOUT, height=360,
-                                          title=f"Final Capital Distribution — {mc_runs:,} simulations",
-                                          xaxis_title="Final Capital ($)")
-                    st.plotly_chart(fig_mch, use_container_width=True)
-
-                with col_mcb:
-                    sorted_c = np.sort(curves)
-                    fig_sor  = go.Figure()
-                    fig_sor.add_trace(go.Scatter(
-                        x=list(range(len(sorted_c))), y=sorted_c,
-                        line=dict(color="#b24bff", width=2),
-                        fill="tozeroy",
-                        fillcolor="rgba(178,75,255,0.06)",
-                    ))
-                    fig_sor.add_hline(y=initial_capital, line_dash="dash",
-                                      line_color="rgba(255,255,255,0.2)", line_width=1.5,
-                                      annotation_text="Initial Capital",
-                                      annotation_font=dict(color="#ffffff", family="JetBrains Mono", size=10))
-                    fig_sor.add_hrect(y0=p25, y1=p75, fillcolor="rgba(0,220,255,0.04)", line_width=0)
-                    fig_sor.update_layout(**PLOTLY_LAYOUT, height=360,
-                                          title="Sorted Outcomes (IQR shaded)",
-                                          xaxis_title="Simulation (ranked)",
-                                          yaxis_title="Final Capital ($)")
-                    st.plotly_chart(fig_sor, use_container_width=True)
+        st.markdown("""
+        <div class="info-box">
+          Resamples the backtest R-multiples 10,000 times in random sequences to test for sequence-of-returns risk and calculate probability of drawdown limit violation.
+        </div>
+        """, unsafe_allow_html=True)
+        
+        mc_sims = st.slider("Simulations Count", 200, 5000, 1000, step=100)
+        run_mc_btn = st.button("🎲 Run Bootstrap Simulations")
+        
+        if run_mc_btn:
+            with st.spinner("Shuffling returns..."):
+                r_list = res["R_List"]
+                curves = []
+                for _ in range(mc_sims):
+                    bal = float(initial_capital)
+                    for _ in range(len(r_list)):
+                        r = np.random.choice(r_list)
+                        bal *= 1 + (r * (risk_pct / 100))
+                    curves.append(bal)
+                st.session_state.mc_simulations = curves
+                
+        if "mc_simulations" in st.session_state:
+            sims = st.session_state.mc_simulations
+            p5 = np.percentile(sims, 5)
+            p25 = np.percentile(sims, 25)
+            med = np.median(sims)
+            p75 = np.percentile(sims, 75)
+            p95 = np.percentile(sims, 95)
+            ruin_prob = sum(1 for c in sims if c < initial_capital) / len(sims) * 100
+            
+            c_mc1, c_mc2, c_mc3, c_mc4, c_mc5, c_mc6 = st.columns(6)
+            with c_mc1:
+                st.markdown(metric_card("Worst 5%", f"${p5:,.0f}", "Bear Case", "negative"), unsafe_allow_html=True)
+            with c_mc2:
+                st.markdown(metric_card("Worst 25%", f"${p25:,.0f}", "Conservative Case", "negative"), unsafe_allow_html=True)
+            with c_mc3:
+                st.markdown(metric_card("Median Outcome", f"${med:,.0f}", "Base Case", "neutral"), unsafe_allow_html=True)
+            with c_mc4:
+                st.markdown(metric_card("Best 25%", f"${p75:,.0f}", "Bull Case", "positive"), unsafe_allow_html=True)
+            with c_mc5:
+                st.markdown(metric_card("Best 5%", f"${p95:,.0f}", "High Performance", "positive"), unsafe_allow_html=True)
+            with c_mc6:
+                st.markdown(metric_card("Ruin Prob.", f"{ruin_prob:.1f}%", "End balance < start", "negative" if ruin_prob > 25.0 else "positive"), unsafe_allow_html=True)
+                
+            st.markdown("<br>", unsafe_allow_html=True)
+            col_mch1, col_mch2 = st.columns(2)
+            with col_mch1:
+                # Histogram
+                fig_hist = go.Figure(go.Histogram(
+                    x=sims, nbinsx=50,
+                    marker=dict(color="#00dcff", opacity=0.7, line=dict(color="rgba(0,0,0,0.2)", width=0.5))
+                ))
+                fig_hist.add_vline(x=initial_capital, line_dash="dash", line_color="#ff3366", line_width=1.5, annotation_text="Initial Balance")
+                fig_hist.add_vline(x=med, line_dash="solid", line_color="#00ff88", line_width=1.5, annotation_text="Median Balance")
+                fig_hist.update_layout(**PLOTLY_LAYOUT, height=340, title="Final Portfolio Value Distribution", xaxis_title="Capital ($)")
+                st.plotly_chart(fig_hist, use_container_width=True)
+                
+            with col_mch2:
+                # Cumulative Rank Curve
+                sorted_sims = np.sort(sims)
+                fig_crv = go.Figure(go.Scatter(
+                    x=list(range(len(sorted_sims))), y=sorted_sims,
+                    fill="tozeroy", fillcolor="rgba(178,75,255,0.06)",
+                    line=dict(color="#b24bff", width=2)
+                ))
+                fig_crv.add_hline(y=initial_capital, line_dash="dash", line_color="rgba(255,255,255,0.15)", line_width=1)
+                fig_crv.update_layout(**PLOTLY_LAYOUT, height=340, title="Sorted Simulation Capital Outcomes", xaxis_title="Simulations Ranked", yaxis_title="Portfolio Balance ($)")
+                st.plotly_chart(fig_crv, use_container_width=True)
 
 # ══════════════════════════════════════════════════════
-#  TAB 6 — TRADE LOG
+# TAB 7: TRADE LOG
 # ══════════════════════════════════════════════════════
-with tab_trades:
-    section_header("◈", "Full Trade Log")
-
-    if "last_result" not in st.session_state or not st.session_state["last_result"].get("trade_records"):
-        st.markdown("""
-        <div class="info-box">Run the backtest first (Tab 3) to populate the trade log.</div>
-        """, unsafe_allow_html=True)
+with tab_log:
+    section_header("📋", "Executed Strategy Trades")
+    
+    if res is None or not res.get("trade_records"):
+        st.warning("Please run a backtest (Tab 4) to generate trade history records.")
     else:
-        trades_df           = pd.DataFrame(st.session_state["last_result"]["trade_records"])
-        trades_df["Result"] = trades_df.apply(lambda x: "OPEN" if x.get("status") == "OPEN" else ("WIN" if x["pnl_currency"] > 0 else "LOSS"), axis=1)
-
-        col_f1, col_f2, col_f3 = st.columns(3)
-        type_filter   = col_f1.multiselect("Direction", ["long","short"], default=["long","short"])
-        result_filter = col_f2.multiselect("Result",    ["WIN","LOSS","OPEN"], default=["WIN","LOSS","OPEN"])
-        sort_by       = col_f3.selectbox("Sort by", ["entry_time","pnl_currency","R"], index=0)
-
-        filtered = trades_df[
-            trades_df["type"].isin(type_filter) & trades_df["Result"].isin(result_filter)
-        ].sort_values(sort_by, ascending=(sort_by == "entry_time"))
-
-        wins_f    = (filtered["pnl_currency"] > 0).sum()
-        total_f   = len(filtered)
-        wr_f      = wins_f / total_f * 100 if total_f > 0 else 0
-        total_pnl = filtered["pnl_currency"].sum()
-        avg_r     = filtered["R"].mean() if total_f > 0 else 0
-
-        c1,c2,c3,c4 = st.columns(4)
-        for col, label, val, sub, clr in [
-            (c1, "Filtered Trades", str(total_f),          f"{wins_f}W / {total_f-wins_f}L", "neutral"),
-            (c2, "Win Rate",        f"{wr_f:.1f}%",        "on filtered set",                 "positive" if wr_f>50 else "negative"),
-            (c3, "Total PnL",       f"${total_pnl:,.2f}",  "filtered trades",                 "positive" if total_pnl>=0 else "negative"),
-            (c4, "Avg R",           f"{avg_r:.3f}R",       "average R multiple",              "positive" if avg_r>0 else "negative"),
-        ]:
-            with col:
-                st.markdown(metric_card(label, val, sub, clr), unsafe_allow_html=True)
-
+        trades_df = pd.DataFrame(res["trade_records"])
+        
+        col_lf1, col_lf2 = st.columns(2)
+        lf_side = col_lf1.multiselect("Direction Side", ["long", "short"], default=["long", "short"])
+        lf_res = col_lf2.multiselect("Exit Outcome Reason", ["Stop Loss", "Take Profit", "Exit Rule", "End of Dataset"], default=["Stop Loss", "Take Profit", "Exit Rule", "End of Dataset"])
+        
+        filtered_df = trades_df[trades_df["type"].isin(lf_side) & trades_df["reason"].isin(lf_res)]
+        
+        # Display summary for log
+        w_f = (filtered_df["pnl_currency"] > 0).sum()
+        tot_f = len(filtered_df)
+        wr_f = (w_f / tot_f) * 100 if tot_f > 0 else 0
+        pnl_f = filtered_df["pnl_currency"].sum()
+        
+        c_lf1, c_lf2, c_lf3 = st.columns(3)
+        with c_lf1:
+            st.markdown(metric_card("Total Trades", str(tot_f), "Trades count", "neutral"), unsafe_allow_html=True)
+        with c_lf2:
+            st.markdown(metric_card("Log Win Rate", f"{wr_f:.1f}%", f"{w_f} Wins", "positive" if wr_f >= 50.0 else "negative"), unsafe_allow_html=True)
+        with c_lf3:
+            st.markdown(metric_card("Net Returns Sum", f"${pnl_f:+,.2f}", "Profit / Loss sum", "positive" if pnl_f >= 0 else "negative"), unsafe_allow_html=True)
+            
         st.markdown("<br>", unsafe_allow_html=True)
-
-        display_cols   = ["status","type","entry_time","entry_price","exit_time","exit_price","pnl_currency","R","size","risk_amount"]
-        available_cols = [c for c in display_cols if c in filtered.columns]
+        
         st.dataframe(
-            filtered[available_cols].rename(columns={
-                "status": "Status", "type": "Side", "entry_time": "Entry Time", "entry_price": "Entry $",
+            filtered_df.rename(columns={
+                "type": "Side", "entry_time": "Entry Time", "entry_price": "Entry $",
                 "exit_time": "Exit Time", "exit_price": "Exit $",
                 "pnl_currency": "PnL ($)", "R": "R Multiple",
-                "size": "Position Size", "risk_amount": "Risk ($)",
+                "size": "Size (BTC)", "risk_amount": "Risk ($)", "reason": "Exit Reason"
             }).style.format({
-                "Entry $": "${:.2f}", "Exit $": "${:.2f}", "PnL ($)": "${:.2f}",
-                "R Multiple": "{:.3f}", "Position Size": "{:.4f}", "Risk ($)": "${:.2f}",
+                "Entry $": "${:.2f}", "Exit $": "${:.2f}", "PnL ($)": "${:,.2f}",
+                "R Multiple": "{:+.2f}R", "Size (BTC)": "{:.4f}", "Risk ($)": "${:.2f}"
             }),
-            use_container_width=True, height=460,
+            use_container_width=True, height=350
         )
-
+        
+        # Download link
+        csv_data = filtered_df.to_csv(index=False).encode("utf-8")
         st.download_button(
-            "⬇  EXPORT TRADE LOG (CSV)",
-            filtered.drop(columns=["Result"]).to_csv(index=False).encode(),
-            "trade_log.csv", "text/csv",
-            use_container_width=True,
+            label="⬇  Export Trade Log to CSV",
+            data=csv_data,
+            file_name="btc_custom_trade_log.csv",
+            mime="text/csv",
+            use_container_width=True
         )
-
-        cyber_divider()
-        section_header("◈", "Trade PnL Timeline")
-        max_abs = filtered["pnl_currency"].abs().max()
-        fig_tl = go.Figure()
-        fig_tl.add_trace(go.Scatter(
-            x=filtered["entry_time"],
-            y=filtered["pnl_currency"],
-            mode="markers",
-            marker=dict(
-                color=filtered["pnl_currency"].apply(
-                    lambda x: "rgba(0,255,136,0.75)" if x > 0 else "rgba(255,51,102,0.75)"
-                ),
-                size=filtered["pnl_currency"].abs() / max_abs * 20 + 5 if max_abs > 0 else 8,
-                line=dict(color="rgba(255,255,255,0.05)", width=0.5),
-            ),
-            text=filtered.apply(
-                lambda r: f"{r['type'].upper()}<br>PnL: ${r['pnl_currency']:.2f}<br>R: {r['R']:.3f}", axis=1
-            ),
-            hovertemplate="%{text}<extra></extra>",
-            name="Trades",
-        ))
-        fig_tl.add_hline(y=0, line_color="rgba(255,255,255,0.08)", line_width=1)
-        fig_tl.update_layout(**PLOTLY_LAYOUT, height=300,
-                              yaxis_title="PnL ($)", title="Individual Trade PnL over Time")
-        st.plotly_chart(fig_tl, use_container_width=True)
-
-# ── Footer ──
-st.markdown("""
-<div style="
-  text-align:center;
-  padding:32px 0 20px;
-  margin-top:40px;
-  border-top:1px solid rgba(0,220,255,0.08);
-  font-family:'JetBrains Mono',monospace;
-  font-size:11px;
-  color:#1e3a52;
-  letter-spacing:1.5px;
-  text-transform:uppercase;
-">
-  BTC Algo Trader Pro · EMA Trend Filter · ATR Regime · Swing Structure · Built with Streamlit &amp; Plotly
-</div>
-""", unsafe_allow_html=True)
