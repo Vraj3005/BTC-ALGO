@@ -45,11 +45,11 @@ def supertrend(df, period=10, multiplier=3):
     upperband = basic_upper.copy()
     lowerband = basic_lower.copy()
     
-    upperband_vals = upperband.values
-    lowerband_vals = lowerband.values
-    close_vals = close.values
-    basic_upper_vals = basic_upper.values
-    basic_lower_vals = basic_lower.values
+    upperband_vals = upperband.to_numpy(copy=True)
+    lowerband_vals = lowerband.to_numpy(copy=True)
+    close_vals = close.to_numpy(copy=False)
+    basic_upper_vals = basic_upper.to_numpy(copy=False)
+    basic_lower_vals = basic_lower.to_numpy(copy=False)
     
     in_trend = np.ones(len(df), dtype=bool) # True = Long (Green), False = Short (Red)
     super_trend = np.zeros(len(df))
